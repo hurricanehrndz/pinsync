@@ -7,6 +7,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 
@@ -34,6 +35,16 @@ func sha(content string) string {
 	return hex.EncodeToString(sum[:])
 }
 
+// wantMode maps a POSIX permission expectation to what the platform actually
+// stores. Build only ever feeds push (POSIX-only, P1); on Windows the perm
+// bits collapse to writable/read-only.
+func wantMode(posix string) string {
+	if runtime.GOOS != "windows" {
+		return posix
+	}
+	return "0666"
+}
+
 func TestBuild(t *testing.T) {
 	root := t.TempDir()
 	writeFile(t, root, "b.txt", "hello", 0o644)
@@ -47,8 +58,8 @@ func TestBuild(t *testing.T) {
 		t.Errorf("Version = %d, want 1", m.Version)
 	}
 	want := []manifest.File{
-		{Path: "b.txt", SHA256: sha("hello"), Size: 5, Mode: "0644"},
-		{Path: "sub/a.txt", SHA256: sha("world!"), Size: 6, Mode: "0600"},
+		{Path: "b.txt", SHA256: sha("hello"), Size: 5, Mode: wantMode("0644")},
+		{Path: "sub/a.txt", SHA256: sha("world!"), Size: 6, Mode: wantMode("0600")},
 	}
 	if len(m.Files) != len(want) {
 		t.Fatalf("Files = %+v, want %+v", m.Files, want)
@@ -85,6 +96,9 @@ func TestBuildDeterministic(t *testing.T) {
 }
 
 func TestBuildModeFormatting(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("mode recording is a POSIX concern; push refuses to run on Windows (P1)")
+	}
 	for _, tc := range []struct {
 		perm fs.FileMode
 		want string

@@ -10,6 +10,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 
@@ -40,9 +41,18 @@ func writeFile(t *testing.T, root, rel, content string, perm fs.FileMode) {
 }
 
 // pushFixture publishes files (all 0644) through the real push path into the
-// fake, so pull tests consume exactly what push produces.
+// fake, so pull tests consume exactly what push produces. Push is POSIX-only
+// (P1), so on Windows the fake is seeded with the same bytes push would have
+// produced; push↔pull interop stays covered by the POSIX runs.
 func pushFixture(t *testing.T, fake *s3test.Fake, files map[string]string) {
 	t.Helper()
+	if runtime.GOOS == "windows" {
+		for rel, content := range files {
+			fake.Store(prefix+"/"+rel, []byte(content))
+		}
+		fake.Store(manifestKey, encodeManifest(t, files))
+		return
+	}
 	root := t.TempDir()
 	for rel, content := range files {
 		writeFile(t, root, rel, content, 0o644)
@@ -50,6 +60,26 @@ func pushFixture(t *testing.T, fake *s3test.Fake, files map[string]string) {
 	if _, err := push.Push(context.Background(), fake, "bkt", prefix, root, push.Options{}); err != nil {
 		t.Fatalf("push fixture: %v", err)
 	}
+}
+
+// encodeManifest renders the manifest push would produce for files (all 0644).
+func encodeManifest(t *testing.T, files map[string]string) []byte {
+	t.Helper()
+	m := &manifest.Manifest{Version: 1}
+	for rel, content := range files {
+		sum := sha256.Sum256([]byte(content))
+		m.Files = append(m.Files, manifest.File{
+			Path:   rel,
+			SHA256: hex.EncodeToString(sum[:]),
+			Size:   int64(len(content)),
+			Mode:   "0644",
+		})
+	}
+	var buf bytes.Buffer
+	if err := m.Encode(&buf); err != nil {
+		t.Fatal(err)
+	}
+	return buf.Bytes()
 }
 
 func doPull(t *testing.T, fake *s3test.Fake, dest string) (pull.Stats, error) {
@@ -143,8 +173,10 @@ func TestPullFresh(t *testing.T) {
 	if stats.Downloaded != 3 || stats.Total != 3 {
 		t.Errorf("stats = %+v, want 3 downloaded of 3", stats)
 	}
-	if mode := statMode(t, filepath.Join(dest, "a.txt")); mode != 0o644 {
-		t.Errorf("a.txt mode = %#o, want 0644", mode)
+	if runtime.GOOS != "windows" {
+		if mode := statMode(t, filepath.Join(dest, "a.txt")); mode != 0o644 {
+			t.Errorf("a.txt mode = %#o, want 0644", mode)
+		}
 	}
 	if fake.GetMode(manifestKey) != types.ChecksumModeEnabled {
 		t.Error("manifest fetched without ChecksumMode=ENABLED")
@@ -233,6 +265,9 @@ func TestPullRepairsTruncated(t *testing.T) {
 }
 
 func TestPullModeOnlyChangeCopies(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("modes are not meaningful on Windows; the content-only decision is the specified behavior (L3)")
+	}
 	fake := s3test.NewFake()
 	files := map[string]string{"a.txt": "alpha"}
 	pushFixture(t, fake, files) // manifest records 0644
@@ -334,7 +369,7 @@ func TestPullRetryConvergesOnManifestRace(t *testing.T) {
 	// Overwrite-in-place race: the object already holds new bytes, the
 	// manifest still describes the old ones.
 	fake.Store(prefix+"/a.txt", []byte("new-content"))
-	corrected := correctedManifest(t, "a.txt", "new-content")
+	corrected := encodeManifest(t, map[string]string{"a.txt": "new-content"})
 	gets := 0
 	fake.BeforeGet = func(f *s3test.Fake, key string) {
 		if key != manifestKey {
@@ -352,22 +387,6 @@ func TestPullRetryConvergesOnManifestRace(t *testing.T) {
 		t.Errorf("stats = %+v, want Downloaded=1", stats)
 	}
 	assertTree(t, dest, map[string]string{"a.txt": "new-content"})
-}
-
-func correctedManifest(t *testing.T, path, content string) []byte {
-	t.Helper()
-	sum := sha256.Sum256([]byte(content))
-	m := &manifest.Manifest{Version: 1, Files: []manifest.File{{
-		Path:   path,
-		SHA256: hex.EncodeToString(sum[:]),
-		Size:   int64(len(content)),
-		Mode:   "0644",
-	}}}
-	var buf bytes.Buffer
-	if err := m.Encode(&buf); err != nil {
-		t.Fatal(err)
-	}
-	return buf.Bytes()
 }
 
 func TestPullCrashRecovery(t *testing.T) {
@@ -433,6 +452,9 @@ func TestPullEmptyManifest(t *testing.T) {
 }
 
 func TestPullAppliesModesFresh(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("push is POSIX-only (P1) and exact modes are a macOS/Linux promise (L12)")
+	}
 	fake := s3test.NewFake()
 	root := t.TempDir()
 	writeFile(t, root, "secret.pem", "key", 0o600)
