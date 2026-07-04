@@ -5,6 +5,7 @@
   packages = with pkgs; [
     just
     golangci-lint
+    minio # spawned by `go test -tags integration` (internal/s3test)
   ];
 
   languages.rust.enable = true;

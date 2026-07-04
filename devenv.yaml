@@ -12,7 +12,6 @@ inputs:
     inputs:
       nixpkgs:
         follows: nixpkgs
-
 # If you're using non-OSS software, you can set allow_unfree to true.
 # allow_unfree: true
 
@@ -22,6 +21,11 @@ inputs:
 # If you're willing to use a package that's vulnerable
 # permitted_insecure_packages:
 #  - "openssl-1.1.1w"
+#
+# minio is in nixpkgs' insecure list since upstream entered maintenance mode;
+# we only exec it as a loopback test server from `go test -tags integration`.
+permitted_insecure_packages:
+  - "minio-2025-10-15T17-29-55Z"
 
 # If you have more than one devenv you can merge them
 #imports:
