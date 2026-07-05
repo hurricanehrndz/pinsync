@@ -33,8 +33,9 @@ type S3API interface {
 
 // Options configures Pull.
 type Options struct {
-	Parallel int          // concurrent downloads; 0 means 16
-	Logger   *slog.Logger // nil means discard
+	Parallel    int          // concurrent downloads; 0 means 16
+	Logger      *slog.Logger // nil means discard
+	ManifestKey string       // "" means <prefix>/manifest.json
 
 	// Fixed in v1; kept internal until a caller needs them.
 	mismatchRetries int // full re-sync attempts on staged-hash mismatch; 0 means 3
@@ -71,6 +72,7 @@ func Pull(ctx context.Context, client S3API, bucket, prefix, dest string, opts O
 		parallel:     max(opts.Parallel, 0),
 		logger:       opts.Logger,
 		swapAttempts: opts.swapRetries,
+		manifestKey:  opts.ManifestKey,
 	}
 	if s.parallel == 0 {
 		s.parallel = 16
@@ -122,6 +124,7 @@ type syncer struct {
 	parallel       int
 	logger         *slog.Logger
 	swapAttempts   int
+	manifestKey    string
 }
 
 // syncOnce runs one fetch → hash → stage → swap cycle. On any error the
@@ -150,10 +153,13 @@ func (s *syncer) syncOnce(ctx context.Context) (Stats, error) {
 	return stats, nil
 }
 
-// fetchManifest gets and validates <prefix>/manifest.json before anything
-// under dest is touched.
+// fetchManifest gets and validates the manifest key (default
+// <prefix>/manifest.json) before anything under dest is touched.
 func (s *syncer) fetchManifest(ctx context.Context) (*manifest.Manifest, error) {
-	key := path.Join(s.prefix, manifest.Name)
+	key := s.manifestKey
+	if key == "" {
+		key = path.Join(s.prefix, manifest.Name)
+	}
 	out, err := s.client.GetObject(ctx, &s3.GetObjectInput{
 		Bucket:       aws.String(s.bucket),
 		Key:          aws.String(key),

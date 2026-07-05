@@ -484,6 +484,45 @@ func TestPullUnicodeAndSpacesAndDepth(t *testing.T) {
 	assertTree(t, dest, files)
 }
 
+func TestPullManifestKeyCustomLocation(t *testing.T) {
+	fake := s3test.NewFake()
+	files := map[string]string{"a.txt": "alpha", "sub/b.txt": "bravo"}
+	pushFixture(t, fake, files)
+
+	// Relocate the manifest to a key outside the content tree and remove it from
+	// the default location, so a pull that ignored ManifestKey would fail.
+	const customKey = "manifests/site-a.json"
+	body, ok := fake.Object(manifestKey)
+	if !ok {
+		t.Fatal("fixture manifest missing")
+	}
+	fake.Store(customKey, body)
+	fake.Delete(manifestKey)
+
+	dest := filepath.Join(t.TempDir(), "dest")
+	if _, err := pull.Pull(context.Background(), fake, "bkt", prefix, dest,
+		pull.Options{ManifestKey: customKey}); err != nil {
+		t.Fatalf("Pull: %v", err)
+	}
+
+	// The custom key must be the one fetched — proof ManifestKey, not the
+	// default, drove the snapshot.
+	var read bool
+	for _, key := range fake.Gets() {
+		if key == customKey {
+			read = true
+		}
+		if key == manifestKey {
+			t.Errorf("Pull fetched the default manifest key despite ManifestKey=%q", customKey)
+		}
+	}
+	if !read {
+		t.Errorf("custom manifest key never fetched; gets=%v", fake.Gets())
+	}
+	assertTree(t, dest, files)
+	assertNoLeftovers(t, dest)
+}
+
 func TestPullRejectsInvalidManifestBeforeTouchingDest(t *testing.T) {
 	fake := s3test.NewFake()
 	pushFixture(t, fake, map[string]string{"a.txt": "alpha"})

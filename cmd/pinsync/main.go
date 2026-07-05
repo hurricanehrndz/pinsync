@@ -41,13 +41,14 @@ func main() {
 
 // cli holds the parsed command line.
 type cli struct {
-	sub      string
-	bucket   string
-	prefix   string
-	region   string
-	endpoint string
-	parallel int
-	dir      string
+	sub         string
+	bucket      string
+	prefix      string
+	region      string
+	endpoint    string
+	parallel    int
+	dir         string
+	manifestKey string
 
 	// Logging flags. The raw -log-level value is parsed into logLevelVal by
 	// parseArgs so bad input fails before any store or AWS work.
@@ -72,6 +73,15 @@ type cli struct {
 	raStore rolesanywhere.StoreLoc
 }
 
+// posArgName returns the human-readable name for the required positional
+// argument of the given subcommand.
+func posArgName(sub string) string {
+	if sub == "pull" {
+		return "destination directory"
+	}
+	return "root directory"
+}
+
 // parseArgs parses the subcommand and its flags; the one positional argument
 // is the local root (push) or destination (pull).
 func parseArgs(args []string, stderr io.Writer) (*cli, error) {
@@ -86,6 +96,7 @@ func parseArgs(args []string, stderr io.Writer) (*cli, error) {
 	fs.SetOutput(stderr)
 	fs.StringVar(&c.bucket, "bucket", "", "S3 bucket (required)")
 	fs.StringVar(&c.prefix, "prefix", "", "key prefix under the bucket")
+	fs.StringVar(&c.manifestKey, "manifest-key", "", "S3 key for the manifest; default <prefix>/manifest.json")
 	fs.IntVar(&c.parallel, "parallel", 16, "concurrent transfers")
 	fs.StringVar(&c.region, "region", "", "AWS region (overrides the default chain)")
 	fs.StringVar(&c.endpoint, "endpoint-url", "", "custom S3 endpoint, e.g. MinIO; implies path-style addressing")
@@ -108,11 +119,7 @@ func parseArgs(args []string, stderr io.Writer) (*cli, error) {
 		return nil, errors.New("-bucket is required")
 	}
 	if fs.NArg() != 1 {
-		what := "root directory"
-		if c.sub == "pull" {
-			what = "destination directory"
-		}
-		return nil, fmt.Errorf("expected exactly one positional argument: the %s", what)
+		return nil, fmt.Errorf("expected exactly one positional argument: the %s", posArgName(c.sub))
 	}
 	c.dir = fs.Arg(0)
 	lvl, err := parseLogLevel(c.logLevel)
@@ -233,7 +240,7 @@ func newLogger(c *cli, w io.Writer) *slog.Logger {
 func execute(ctx context.Context, c *cli, client *s3.Client, logger *slog.Logger) (string, error) {
 	if c.sub == "push" {
 		stats, err := push.Push(ctx, client, c.bucket, c.prefix, c.dir, push.Options{
-			Parallel: c.parallel, Logger: logger,
+			Parallel: c.parallel, Logger: logger, ManifestKey: c.manifestKey,
 		})
 		if err != nil {
 			return "", err
@@ -241,7 +248,7 @@ func execute(ctx context.Context, c *cli, client *s3.Client, logger *slog.Logger
 		return fmt.Sprintf("pushed %d files to s3://%s/%s", stats.Uploaded, c.bucket, c.prefix), nil
 	}
 	stats, err := pull.Pull(ctx, client, c.bucket, c.prefix, c.dir, pull.Options{
-		Parallel: c.parallel, Logger: logger,
+		Parallel: c.parallel, Logger: logger, ManifestKey: c.manifestKey,
 	})
 	if err != nil {
 		return "", err

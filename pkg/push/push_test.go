@@ -137,6 +137,42 @@ func TestPushPrefixHandling(t *testing.T) {
 	}
 }
 
+func TestPushManifestKeyCustomLocation(t *testing.T) {
+	fake := s3test.NewFake()
+	_, err := push.Push(context.Background(), fake, "bkt", "cfg/prod", fixtureTree(t),
+		push.Options{ManifestKey: "manifests/site-a.json"})
+	if err != nil {
+		t.Fatalf("Push: %v", err)
+	}
+	if _, ok := fake.Object("manifests/site-a.json"); !ok {
+		t.Errorf("manifest not written to the custom key; puts=%v", fake.Puts())
+	}
+	// The default location must stay empty: a custom key relocates the snapshot
+	// root, it does not additionally publish at the default path.
+	if _, ok := fake.Object("cfg/prod/manifest.json"); ok {
+		t.Error("manifest also written to the default key")
+	}
+}
+
+func TestPushManifestKeyCollisionUploadsNothing(t *testing.T) {
+	root := t.TempDir()
+	writeFile(t, root, "site.json", "payload")
+	fake := s3test.NewFake()
+	// The custom manifest key names the same object as a content file. Allowing
+	// this would let the manifest clobber a payload (or vice versa), destroying
+	// the atomic-snapshot invariant, so Push must reject it up front.
+	_, err := push.Push(context.Background(), fake, "bkt", "cfg/prod", root,
+		push.Options{ManifestKey: "cfg/prod/site.json"})
+	if err == nil {
+		t.Fatal("Push accepted a manifest key colliding with a content file")
+	}
+	// The guard runs before any upload, so a rejected push leaves the bucket
+	// exactly as it was — no half-written snapshot.
+	if puts := fake.Puts(); len(puts) != 0 {
+		t.Errorf("Push uploaded despite the collision: %v", puts)
+	}
+}
+
 func TestPushRejectsInvalidTreeBeforeUploading(t *testing.T) {
 	root := t.TempDir()
 	writeFile(t, root, "manifest.json", "{}") // reserved top-level name

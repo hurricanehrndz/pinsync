@@ -32,8 +32,9 @@ type S3API interface {
 
 // Options configures Push.
 type Options struct {
-	Parallel int          // concurrent uploads; 0 means 16
-	Logger   *slog.Logger // nil means discard
+	Parallel    int          // concurrent uploads; 0 means 16
+	Logger      *slog.Logger // nil means discard
+	ManifestKey string       // "" means <prefix>/manifest.json
 }
 
 // Stats reports what Push uploaded (the manifest itself is not counted).
@@ -46,8 +47,9 @@ var goos = runtime.GOOS
 
 // Push hashes root, validates the resulting manifest, uploads every content
 // file to <prefix>/<path>, and only after all of them succeed uploads the
-// manifest to <prefix>/manifest.json. On any failure the manifest is left
-// untouched, so readers keep the previous complete snapshot.
+// manifest to Options.ManifestKey (default <prefix>/manifest.json). On any
+// failure the manifest is left untouched, so readers keep the previous
+// complete snapshot.
 func Push(ctx context.Context, client S3API, bucket, prefix, root string, opts Options) (Stats, error) {
 	if goos == "windows" {
 		return Stats{}, errors.New("push: not supported on Windows (POSIX mode bits would be synthetic)")
@@ -65,6 +67,21 @@ func Push(ctx context.Context, client S3API, bucket, prefix, root string, opts O
 	m, err := manifest.Build(root)
 	if err != nil {
 		return Stats{}, err
+	}
+
+	manifestKey := opts.ManifestKey
+	if manifestKey == "" {
+		manifestKey = path.Join(prefix, manifest.Name)
+	}
+	// A custom manifest key that names an uploaded content file would let the
+	// manifest overwrite that file (or vice versa), breaking the atomic-snapshot
+	// invariant. Reject before uploading anything so nothing lands on failure.
+	if opts.ManifestKey != "" {
+		for _, f := range m.Files {
+			if path.Join(prefix, f.Path) == manifestKey {
+				return Stats{}, fmt.Errorf("push: manifest key %q collides with a content file; choose a location outside the uploaded tree", manifestKey)
+			}
+		}
 	}
 
 	g, gctx := errgroup.WithContext(ctx)
@@ -88,7 +105,7 @@ func Push(ctx context.Context, client S3API, bucket, prefix, root string, opts O
 	}
 	if _, err := client.PutObject(ctx, &s3.PutObjectInput{
 		Bucket:            aws.String(bucket),
-		Key:               aws.String(path.Join(prefix, manifest.Name)),
+		Key:               aws.String(manifestKey),
 		Body:              bytes.NewReader(buf.Bytes()),
 		ChecksumAlgorithm: types.ChecksumAlgorithmSha256,
 	}); err != nil {
