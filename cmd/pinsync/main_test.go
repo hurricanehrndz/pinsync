@@ -7,7 +7,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/hurricanehrndz/pinsync/internal/rolesanywhere"
+	"github.com/hurricanehrndz/pinsync/pkg/rolesanywhere"
 )
 
 func TestParseArgs(t *testing.T) {

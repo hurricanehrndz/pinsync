@@ -19,9 +19,9 @@ import (
 	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 
-	"github.com/hurricanehrndz/pinsync/internal/rolesanywhere"
 	"github.com/hurricanehrndz/pinsync/pkg/pull"
 	"github.com/hurricanehrndz/pinsync/pkg/push"
+	"github.com/hurricanehrndz/pinsync/pkg/rolesanywhere"
 )
 
 const usage = `usage:
