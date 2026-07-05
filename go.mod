@@ -7,6 +7,8 @@ require (
 	github.com/aws/aws-sdk-go-v2/config v1.32.27
 	github.com/aws/aws-sdk-go-v2/credentials v1.19.26
 	github.com/aws/aws-sdk-go-v2/service/s3 v1.104.2
+	github.com/aws/rolesanywhere-credential-helper v1.8.4
+	github.com/aws/smithy-go v1.27.3
 	github.com/tailscale/certstore v0.1.1-0.20260409135935-3638fb84b77d
 	golang.org/x/sync v0.21.0
 )
@@ -25,6 +27,5 @@ require (
 	github.com/aws/aws-sdk-go-v2/service/sso v1.31.5 // indirect
 	github.com/aws/aws-sdk-go-v2/service/ssooidc v1.36.8 // indirect
 	github.com/aws/aws-sdk-go-v2/service/sts v1.43.5 // indirect
-	github.com/aws/smithy-go v1.27.3 // indirect
-	golang.org/x/sys v0.13.0 // indirect
+	golang.org/x/sys v0.45.0 // indirect
 )
