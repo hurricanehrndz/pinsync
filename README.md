@@ -9,8 +9,21 @@ delete phase, corrupted or extraneous local files converge by construction.
 ## Build
 
 ```sh
-go build ./cmd/pinsync
+go build ./cmd/pinsync   # or: just build
 ```
+
+The linux and windows targets are pure Go and need no C toolchain
+(`just build`, `just build-windows [arch]`). The darwin target links the
+system certificate store via cgo, so it cross-builds with `zig cc` against a
+pinned macOS SDK:
+
+```sh
+just build-darwin arm64   # or amd64
+```
+
+Run it inside the devshell (`direnv exec .` / `devenv shell`), which supplies
+both `zig` and `MACOS_SDK`. It also works anywhere else with `zig` on `PATH`
+and `MACOS_SDK` pointing at a macOS SDK root.
 
 ## Push (POSIX CI only)
 

@@ -1,11 +1,29 @@
 { pkgs, ... }:
 
+let
+  # Community-mirrored macOS SDK, used to cross-build the darwin cgo target
+  # (tailscale/certstore links CoreFoundation + Security) with `zig cc` as the
+  # C compiler. Fixed-output derivation: hash pins the fetched tarball.
+  macosSdk = pkgs.stdenvNoCC.mkDerivation {
+    name = "MacOSX15.2.sdk";
+    src = pkgs.fetchzip {
+      url = "https://github.com/joseluisq/macosx-sdks/releases/download/15.2/MacOSX15.2.sdk.tar.xz";
+      hash = "sha256-I35yUUjM8zGSaqE/vYz03YCUhpR8uIG1uwJTJvcF8jk=";
+    };
+    dontBuild = true;
+    installPhase = "cp -r . $out";
+  };
+in
 {
+  # Exposed to `just build-darwin` as -isysroot / framework search root.
+  env.MACOS_SDK = "${macosSdk}";
+
   # https://devenv.sh/packages/
   packages = with pkgs; [
     awscli2
     just
     golangci-lint
+    zig # C compiler (clang-based) for the darwin cgo cross-build
     minio # spawned by `go test -tags integration` (internal/s3test)
   ];
 

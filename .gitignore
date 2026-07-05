@@ -1,3 +1,9 @@
+# Built binaries (native + cross-compiled) and zig's build cache
+/pinsync
+/pinsync-windows-*.exe
+/pinsync-darwin-*
+.zig-cache/
+
 # ra-test generated state (CA key, certs, env file)
 hack/ra-test/state/
 
