@@ -10,11 +10,16 @@ import (
 	"io"
 	"log/slog"
 	"os"
+	"regexp"
+	"strings"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/aws/arn"
 	awsconfig "github.com/aws/aws-sdk-go-v2/config"
+	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 
+	"github.com/hurricanehrndz/pinsync/internal/rolesanywhere"
 	"github.com/hurricanehrndz/pinsync/pkg/pull"
 	"github.com/hurricanehrndz/pinsync/pkg/push"
 )
@@ -47,6 +52,21 @@ type cli struct {
 	parallel int
 	verbose  bool
 	dir      string
+
+	// IAM Roles Anywhere flags (pull only, macOS/Windows). The raw flag
+	// values are parsed into raMode/raRegex/raField/raStore by parseArgs so
+	// bad input fails before any store or AWS work.
+	raTrustAnchor string
+	raProfile     string
+	raRole        string
+	raCertPattern string
+	raCertField   string
+	raCertStore   string
+
+	raMode  bool
+	raRegex *regexp.Regexp
+	raField rolesanywhere.CertField
+	raStore rolesanywhere.StoreLoc
 }
 
 // parseArgs parses the subcommand and its flags; the one positional argument
@@ -67,6 +87,16 @@ func parseArgs(args []string, stderr io.Writer) (*cli, error) {
 	fs.StringVar(&c.region, "region", "", "AWS region (overrides the default chain)")
 	fs.StringVar(&c.endpoint, "endpoint-url", "", "custom S3 endpoint, e.g. MinIO; implies path-style addressing")
 	fs.BoolVar(&c.verbose, "v", false, "log progress to stderr")
+	// IAM Roles Anywhere is a pull-only device flow; registering these on pull
+	// alone makes push reject them as unknown flags for free.
+	if c.sub == "pull" {
+		fs.StringVar(&c.raTrustAnchor, "ra-trust-anchor-arn", "", "IAM Roles Anywhere trust anchor ARN")
+		fs.StringVar(&c.raProfile, "ra-profile-arn", "", "IAM Roles Anywhere profile ARN")
+		fs.StringVar(&c.raRole, "ra-role-arn", "", "IAM role ARN to assume via Roles Anywhere")
+		fs.StringVar(&c.raCertPattern, "ra-cert-pattern", "", "regex selecting the device certificate by CN")
+		fs.StringVar(&c.raCertField, "ra-cert-field", "subject", "certificate CN to match: subject|issuer")
+		fs.StringVar(&c.raCertStore, "ra-cert-store", "user", "windows only: user|machine; ignored on macOS")
+	}
 	if err := fs.Parse(args[1:]); err != nil {
 		return nil, err
 	}
@@ -81,7 +111,60 @@ func parseArgs(args []string, stderr io.Writer) (*cli, error) {
 		return nil, fmt.Errorf("expected exactly one positional argument: the %s", what)
 	}
 	c.dir = fs.Arg(0)
+	if err := parseRAFlags(c, fs); err != nil {
+		return nil, err
+	}
 	return c, nil
+}
+
+// parseRAFlags detects whether IAM Roles Anywhere mode is active — any -ra-*
+// flag explicitly passed (even the defaulted -ra-cert-field/-ra-cert-store) —
+// and, when so, validates every required ARN together and parses the pattern,
+// field, and store so all bad input fails before any store or AWS work.
+func parseRAFlags(c *cli, fs *flag.FlagSet) error {
+	set := map[string]bool{}
+	fs.Visit(func(f *flag.Flag) {
+		if strings.HasPrefix(f.Name, "ra-") {
+			set[f.Name] = true
+		}
+	})
+	if len(set) == 0 {
+		return nil
+	}
+	c.raMode = true
+
+	var missing []string
+	if c.raTrustAnchor == "" {
+		missing = append(missing, "-ra-trust-anchor-arn")
+	}
+	if c.raProfile == "" {
+		missing = append(missing, "-ra-profile-arn")
+	}
+	if c.raRole == "" {
+		missing = append(missing, "-ra-role-arn")
+	}
+	if c.raCertPattern == "" {
+		missing = append(missing, "-ra-cert-pattern")
+	}
+	if len(missing) > 0 {
+		return fmt.Errorf("IAM Roles Anywhere requires: %s", strings.Join(missing, ", "))
+	}
+
+	re, err := regexp.Compile(c.raCertPattern)
+	if err != nil {
+		return fmt.Errorf("invalid -ra-cert-pattern %q: %w", c.raCertPattern, err)
+	}
+	c.raRegex = re
+
+	c.raField, err = rolesanywhere.ParseCertField(c.raCertField)
+	if err != nil {
+		return err
+	}
+	c.raStore, err = rolesanywhere.ParseStoreLoc(c.raCertStore)
+	if err != nil {
+		return err
+	}
+	return nil
 }
 
 func run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
@@ -93,7 +176,7 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 	if c.verbose {
 		logger = slog.New(slog.NewTextHandler(stderr, nil))
 	}
-	client, err := newClient(ctx, c.region, c.endpoint)
+	client, err := newClient(ctx, c)
 	if err != nil {
 		return err
 	}
@@ -126,21 +209,82 @@ func execute(ctx context.Context, c *cli, client *s3.Client, logger *slog.Logger
 		stats.Total, stats.Downloaded, stats.Linked, stats.Copied), nil
 }
 
-// newClient resolves credentials and region via the standard SDK default
-// chain; a custom endpoint (MinIO) switches to path-style addressing.
-func newClient(ctx context.Context, region, endpoint string) (*s3.Client, error) {
+// newClient builds the S3 client. Without Roles Anywhere it resolves
+// credentials and region via the standard SDK default chain; a custom endpoint
+// (MinIO) switches to path-style addressing.
+func newClient(ctx context.Context, c *cli) (*s3.Client, error) {
+	if c.raMode {
+		return newRAClient(ctx, c)
+	}
 	var loadOpts []func(*awsconfig.LoadOptions) error
-	if region != "" {
-		loadOpts = append(loadOpts, awsconfig.WithRegion(region))
+	if c.region != "" {
+		loadOpts = append(loadOpts, awsconfig.WithRegion(c.region))
 	}
 	cfg, err := awsconfig.LoadDefaultConfig(ctx, loadOpts...)
 	if err != nil {
 		return nil, err
 	}
 	return s3.NewFromConfig(cfg, func(o *s3.Options) {
-		if endpoint != "" {
-			o.BaseEndpoint = aws.String(endpoint)
+		if c.endpoint != "" {
+			o.BaseEndpoint = aws.String(c.endpoint)
 			o.UsePathStyle = true
 		}
 	}), nil
+}
+
+// newRAClient selects the device certificate, exchanges it for temporary
+// credentials via IAM Roles Anywhere, and builds the S3 client from them. The
+// region is resolved once and shared by the CreateSession exchange and the S3
+// client so both agree; the certificate's private key never leaves its store.
+func newRAClient(ctx context.Context, c *cli) (*s3.Client, error) {
+	region, err := raRegion(c.region, c.raTrustAnchor)
+	if err != nil {
+		return nil, err
+	}
+	id, _, err := rolesanywhere.FindIdentity(c.raField, c.raRegex, c.raStore)
+	if err != nil {
+		return nil, err
+	}
+	defer id.Close()
+	creds, err := rolesanywhere.Fetch(ctx, id, rolesanywhere.Options{
+		TrustAnchorARN: c.raTrustAnchor,
+		ProfileARN:     c.raProfile,
+		RoleARN:        c.raRole,
+		Region:         region,
+	})
+	if err != nil {
+		return nil, err
+	}
+	cfg, err := awsconfig.LoadDefaultConfig(
+		ctx,
+		awsconfig.WithRegion(region),
+		awsconfig.WithCredentialsProvider(credentials.NewStaticCredentialsProvider(
+			creds.AccessKeyID, creds.SecretAccessKey, creds.SessionToken,
+		)),
+	)
+	if err != nil {
+		return nil, err
+	}
+	return s3.NewFromConfig(cfg, func(o *s3.Options) {
+		if c.endpoint != "" {
+			o.BaseEndpoint = aws.String(c.endpoint)
+			o.UsePathStyle = true
+		}
+	}), nil
+}
+
+// raRegion resolves the region for a Roles Anywhere invocation: the -region
+// flag wins, otherwise it is read from the trust anchor ARN.
+func raRegion(region, trustAnchorARN string) (string, error) {
+	if region != "" {
+		return region, nil
+	}
+	parsed, err := arn.Parse(trustAnchorARN)
+	if err != nil {
+		return "", fmt.Errorf("resolving region from -ra-trust-anchor-arn: %w", err)
+	}
+	if parsed.Region == "" {
+		return "", errors.New("no region: pass -region or use a trust anchor ARN that carries a region")
+	}
+	return parsed.Region, nil
 }

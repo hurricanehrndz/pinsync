@@ -6,6 +6,8 @@ import (
 	"io"
 	"strings"
 	"testing"
+
+	"github.com/hurricanehrndz/pinsync/internal/rolesanywhere"
 )
 
 func TestParseArgs(t *testing.T) {
@@ -22,6 +24,11 @@ func TestParseArgs(t *testing.T) {
 		{"extra positional", []string{"pull", "-bucket", "b", "d1", "d2"}, "exactly one"},
 		{"valid push", []string{"push", "-bucket", "b", "-prefix", "p", "root"}, ""},
 		{"valid pull", []string{"pull", "-bucket", "b", "-endpoint-url", "http://localhost:9000", "dest"}, ""},
+		{"ra flag on push rejected", []string{"push", "-bucket", "b", "-ra-trust-anchor-arn", "arn:x", "root"}, "not defined"},
+		{"ra bad cert-field", []string{"pull", "-bucket", "b", "-ra-trust-anchor-arn", "a", "-ra-profile-arn", "p", "-ra-role-arn", "r", "-ra-cert-pattern", "x", "-ra-cert-field", "org", "dest"}, "invalid certificate field"},
+		{"ra bad cert-store", []string{"pull", "-bucket", "b", "-ra-trust-anchor-arn", "a", "-ra-profile-arn", "p", "-ra-role-arn", "r", "-ra-cert-pattern", "x", "-ra-cert-store", "global", "dest"}, "invalid certificate store"},
+		{"ra bad regex", []string{"pull", "-bucket", "b", "-ra-trust-anchor-arn", "a", "-ra-profile-arn", "p", "-ra-role-arn", "r", "-ra-cert-pattern", "[", "dest"}, "invalid -ra-cert-pattern"},
+		{"ra cert-field alone triggers mode", []string{"pull", "-bucket", "b", "-ra-cert-field", "subject", "dest"}, "-ra-trust-anchor-arn"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -46,6 +53,49 @@ func TestParseArgsHelp(t *testing.T) {
 	_, err := parseArgs([]string{"push", "-h"}, io.Discard)
 	if !errors.Is(err, flag.ErrHelp) {
 		t.Fatalf("parseArgs(-h) = %v, want flag.ErrHelp", err)
+	}
+}
+
+// TestParseArgsRAMissingNamesAll verifies that a partial -ra-* set reports
+// every missing required flag in one error, not just the first — an operator
+// fixes one flag at a time otherwise.
+func TestParseArgsRAMissingNamesAll(t *testing.T) {
+	_, err := parseArgs([]string{"pull", "-bucket", "b", "-ra-trust-anchor-arn", "arn:ta", "dest"}, io.Discard)
+	if err == nil {
+		t.Fatal("parseArgs with only -ra-trust-anchor-arn = nil, want missing-flags error")
+	}
+	for _, want := range []string{"-ra-profile-arn", "-ra-role-arn", "-ra-cert-pattern"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error %q does not name missing flag %q", err, want)
+		}
+	}
+}
+
+// TestParseArgsRAValid checks that a full valid RA set parses, activates RA
+// mode, compiles the pattern, and applies the field/store defaults.
+func TestParseArgsRAValid(t *testing.T) {
+	c, err := parseArgs([]string{
+		"pull", "-bucket", "b",
+		"-ra-trust-anchor-arn", "arn:aws:rolesanywhere:us-east-1:1:trust-anchor/t",
+		"-ra-profile-arn", "arn:aws:rolesanywhere:us-east-1:1:profile/p",
+		"-ra-role-arn", "arn:aws:iam::1:role/r",
+		"-ra-cert-pattern", "dev.ce",
+		"dest",
+	}, io.Discard)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !c.raMode {
+		t.Error("raMode = false, want true")
+	}
+	if c.raRegex == nil || !c.raRegex.MatchString("device") {
+		t.Errorf("raRegex = %v, want compiled pattern matching \"device\"", c.raRegex)
+	}
+	if c.raField != rolesanywhere.FieldSubject {
+		t.Errorf("raField = %v, want default FieldSubject", c.raField)
+	}
+	if c.raStore != rolesanywhere.StoreUser {
+		t.Errorf("raStore = %v, want default StoreUser", c.raStore)
 	}
 }
 
