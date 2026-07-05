@@ -3,6 +3,7 @@
 {
   # https://devenv.sh/packages/
   packages = with pkgs; [
+    awscli2
     just
     golangci-lint
     minio # spawned by `go test -tags integration` (internal/s3test)
