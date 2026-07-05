@@ -5,6 +5,7 @@ package rolesanywhere
 import (
 	"crypto/x509"
 	"fmt"
+	"log/slog"
 	"regexp"
 
 	"github.com/tailscale/certstore"
@@ -19,7 +20,11 @@ import (
 // duplicated handles (winIdentity duplicates each CertContext; macIdentity
 // retains its own CoreFoundation refs and macStore.Close is a no-op), so the
 // returned Identity stays usable after Store.Close.
-func FindIdentity(field CertField, re *regexp.Regexp, loc StoreLoc) (Identity, *x509.Certificate, error) {
+func FindIdentity(logger *slog.Logger, field CertField, re *regexp.Regexp, loc StoreLoc) (Identity, *x509.Certificate, error) {
+	if logger == nil {
+		logger = slog.New(slog.DiscardHandler)
+	}
+
 	store, err := openStore(loc)
 	if err != nil {
 		return nil, nil, err
@@ -31,17 +36,21 @@ func FindIdentity(field CertField, re *regexp.Regexp, loc StoreLoc) (Identity, *
 		return nil, nil, fmt.Errorf("listing certificate identities: %w", err)
 	}
 
+	logger.Debug("rolesanywhere: scanning certificate store", "store", loc.String(), "field", field.String(), "pattern", re.String())
+
 	for i, ident := range idents {
 		cert, err := ident.Certificate()
 		if err != nil {
 			// An identity whose leaf will not parse cannot be selected; skip
 			// it rather than failing the whole scan.
+			logger.Debug("rolesanywhere: skipping identity; certificate did not parse", "error", err)
 			ident.Close()
 			continue
 		}
 		if matchCert(cert, field, re) {
 			// Hand this identity to the caller; close the ones we rejected.
 			closeIdentities(idents[i+1:])
+			logger.Debug("rolesanywhere: selected certificate", "subject", cert.Subject.CommonName, "issuer", cert.Issuer.CommonName, "serial", cert.SerialNumber, "field", field.String(), "store", loc.String())
 			return ident, cert, nil
 		}
 		ident.Close()

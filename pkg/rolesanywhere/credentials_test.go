@@ -1,6 +1,7 @@
 package rolesanywhere
 
 import (
+	"bytes"
 	"context"
 	"crypto"
 	"crypto/ecdsa"
@@ -14,6 +15,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"io"
+	"log/slog"
 	"math/big"
 	"net/http"
 	"net/http/httptest"
@@ -404,6 +406,48 @@ func TestFetchEmptyCredentialSet(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "no credentials") {
 		t.Errorf("error = %q, want it to mention missing credentials", err)
+	}
+}
+
+// TestFetchDoesNotLogSecrets pins the redaction contract: debug logs describe
+// the exchange (region, source) but must never carry credential material. A
+// leaked access key, secret, or session token in logs is a disclosure bug, so
+// this test fails loudly if any of the vended fakes reaches the log buffer.
+func TestFetchDoesNotLogSecrets(t *testing.T) {
+	id := newRSAIdentity(t)
+	expiration := time.Now().Add(time.Hour).UTC().Truncate(time.Second).Format(time.RFC3339)
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.WriteString(w, credsJSON(expiration))
+	}))
+	defer srv.Close()
+
+	var buf bytes.Buffer
+	_, err := Fetch(context.Background(), id, Options{
+		TrustAnchorARN: "arn:aws:rolesanywhere:us-west-2:111122223333:trust-anchor/abc",
+		ProfileARN:     "arn:aws:rolesanywhere:us-west-2:111122223333:profile/def",
+		RoleARN:        "arn:aws:iam::111122223333:role/ra",
+		Region:         "us-west-2",
+		baseEndpoint:   srv.URL,
+		Logger:         slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug})),
+	})
+	if err != nil {
+		t.Fatalf("Fetch: %v", err)
+	}
+
+	logs := buf.String()
+	for _, secret := range []string{"test-secret-access-key", "test-session-token", "AKIATESTACCESSKEY"} {
+		if strings.Contains(logs, secret) {
+			t.Errorf("logs contain credential material %q; secrets must never be logged", secret)
+		}
+	}
+	// Assert the logs carry non-secret diagnostics so the test cannot pass by
+	// simply logging nothing.
+	if !strings.Contains(logs, "us-west-2") {
+		t.Error("logs missing region; expected the session-creation debug line to record it")
+	}
+	if !strings.Contains(logs, "RolesAnywhere") {
+		t.Error("logs missing RolesAnywhere source; expected the credentials debug line to record it")
 	}
 }
 

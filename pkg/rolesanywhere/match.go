@@ -53,6 +53,19 @@ const (
 	StoreMachine
 )
 
+// String returns the wire name of the store ("user" or "machine"), matching
+// the value ParseStoreLoc accepts. It is used in scan diagnostics.
+func (l StoreLoc) String() string {
+	switch l {
+	case StoreUser:
+		return "user"
+	case StoreMachine:
+		return "machine"
+	default:
+		return fmt.Sprintf("StoreLoc(%d)", int(l))
+	}
+}
+
 // ParseStoreLoc parses the config value naming which store to scan. Only
 // "user" and "machine" are accepted.
 func ParseStoreLoc(s string) (StoreLoc, error) {

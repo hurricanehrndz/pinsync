@@ -64,7 +64,7 @@ func Load(ctx context.Context, cfg Config) (aws.Config, error) {
 	if err != nil {
 		return aws.Config{}, err
 	}
-	id, _, err := rolesanywhere.FindIdentity(ra.CertField, ra.CertPattern, ra.CertStore)
+	id, _, err := rolesanywhere.FindIdentity(cfg.Logger, ra.CertField, ra.CertPattern, ra.CertStore)
 	if err != nil {
 		return aws.Config{}, err
 	}
@@ -74,6 +74,7 @@ func Load(ctx context.Context, cfg Config) (aws.Config, error) {
 		ProfileARN:     ra.ProfileARN,
 		RoleARN:        ra.RoleARN,
 		Region:         region,
+		Logger:         cfg.Logger,
 	})
 	if err != nil {
 		return aws.Config{}, err

@@ -5,6 +5,7 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
+	"log/slog"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -22,6 +23,10 @@ type Options struct {
 	RoleARN        string
 	Region         string
 
+	// Logger receives debug-level diagnostics; nil means discard. Credential
+	// material (access key, secret, session token) is never logged.
+	Logger *slog.Logger
+
 	// baseEndpoint, when set, overrides the resolved Roles Anywhere endpoint.
 	// It exists for tests, which point CreateSession at an httptest server;
 	// production leaves it empty and lets the SDK resolve the real endpoint.
@@ -33,10 +38,16 @@ type Options struct {
 // The identity's private key never leaves its store: signing goes through the
 // crypto.Signer returned by id.Signer().
 func Fetch(ctx context.Context, id Identity, opts Options) (aws.Credentials, error) {
+	logger := opts.Logger
+	if logger == nil {
+		logger = slog.New(slog.DiscardHandler)
+	}
+
 	region, err := resolveRegion(opts)
 	if err != nil {
 		return aws.Credentials{}, err
 	}
+	logger.Debug("rolesanywhere: creating session", "region", region, "profileARN", opts.ProfileARN, "roleARN", opts.RoleARN, "trustAnchorARN", opts.TrustAnchorARN)
 
 	leaf, err := id.Certificate()
 	if err != nil {
@@ -78,7 +89,13 @@ func Fetch(ctx context.Context, id Identity, opts Options) (aws.Credentials, err
 	if err != nil {
 		return aws.Credentials{}, fmt.Errorf("rolesanywhere CreateSession: %w", err)
 	}
-	return toCredentials(out)
+
+	creds, err := toCredentials(out)
+	if err != nil {
+		return aws.Credentials{}, err
+	}
+	logger.Debug("rolesanywhere: received temporary credentials", "expires", creds.Expires, "source", creds.Source)
+	return creds, nil
 }
 
 // toCredentials maps a CreateSession response's first credential set to an
