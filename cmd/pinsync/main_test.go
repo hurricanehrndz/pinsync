@@ -4,6 +4,7 @@ import (
 	"errors"
 	"flag"
 	"io"
+	"log/slog"
 	"strings"
 	"testing"
 
@@ -29,6 +30,8 @@ func TestParseArgs(t *testing.T) {
 		{"ra bad cert-store", []string{"pull", "-bucket", "b", "-ra-trust-anchor-arn", "a", "-ra-profile-arn", "p", "-ra-role-arn", "r", "-ra-cert-pattern", "x", "-ra-cert-store", "global", "dest"}, "invalid certificate store"},
 		{"ra bad regex", []string{"pull", "-bucket", "b", "-ra-trust-anchor-arn", "a", "-ra-profile-arn", "p", "-ra-role-arn", "r", "-ra-cert-pattern", "[", "dest"}, "invalid -ra-cert-pattern"},
 		{"ra cert-field alone triggers mode", []string{"pull", "-bucket", "b", "-ra-cert-field", "subject", "dest"}, "-ra-trust-anchor-arn"},
+		{"bad log-level", []string{"pull", "-bucket", "b", "-log-level", "bogus", "dest"}, `invalid -log-level "bogus"`},
+		{"bad log-format", []string{"pull", "-bucket", "b", "-log-format", "yaml", "dest"}, `invalid -log-format "yaml"`},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -107,7 +110,13 @@ func TestParseArgsDefaults(t *testing.T) {
 	if c.parallel != 16 {
 		t.Errorf("parallel = %d, want default 16", c.parallel)
 	}
-	if c.prefix != "" || c.verbose {
+	if c.prefix != "" {
 		t.Errorf("unexpected non-zero defaults: %+v", c)
+	}
+	if c.logLevel != "info" || c.logFormat != "text" {
+		t.Errorf("log defaults = %q/%q, want info/text", c.logLevel, c.logFormat)
+	}
+	if c.logLevelVal != slog.LevelInfo {
+		t.Errorf("logLevelVal = %v, want LevelInfo", c.logLevelVal)
 	}
 }

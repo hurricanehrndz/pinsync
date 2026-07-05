@@ -47,8 +47,14 @@ type cli struct {
 	region   string
 	endpoint string
 	parallel int
-	verbose  bool
 	dir      string
+
+	// Logging flags. The raw -log-level value is parsed into logLevelVal by
+	// parseArgs so bad input fails before any store or AWS work.
+	logLevel  string
+	logFormat string
+
+	logLevelVal slog.Level
 
 	// IAM Roles Anywhere flags (pull only, macOS/Windows). The raw flag
 	// values are parsed into raMode/raRegex/raField/raStore by parseArgs so
@@ -83,7 +89,8 @@ func parseArgs(args []string, stderr io.Writer) (*cli, error) {
 	fs.IntVar(&c.parallel, "parallel", 16, "concurrent transfers")
 	fs.StringVar(&c.region, "region", "", "AWS region (overrides the default chain)")
 	fs.StringVar(&c.endpoint, "endpoint-url", "", "custom S3 endpoint, e.g. MinIO; implies path-style addressing")
-	fs.BoolVar(&c.verbose, "v", false, "log progress to stderr")
+	fs.StringVar(&c.logLevel, "log-level", "info", "log level: debug|info|warn|error")
+	fs.StringVar(&c.logFormat, "log-format", "text", "log format: text|json")
 	// IAM Roles Anywhere is a pull-only device flow; registering these on pull
 	// alone makes push reject them as unknown flags for free.
 	if c.sub == "pull" {
@@ -108,10 +115,33 @@ func parseArgs(args []string, stderr io.Writer) (*cli, error) {
 		return nil, fmt.Errorf("expected exactly one positional argument: the %s", what)
 	}
 	c.dir = fs.Arg(0)
+	lvl, err := parseLogLevel(c.logLevel)
+	if err != nil {
+		return nil, err
+	}
+	c.logLevelVal = lvl
+	if c.logFormat != "text" && c.logFormat != "json" {
+		return nil, fmt.Errorf("invalid -log-format %q: want text|json", c.logFormat)
+	}
 	if err := parseRAFlags(c, fs); err != nil {
 		return nil, err
 	}
 	return c, nil
+}
+
+// parseLogLevel maps a -log-level string to its slog.Level.
+func parseLogLevel(s string) (slog.Level, error) {
+	switch s {
+	case "debug":
+		return slog.LevelDebug, nil
+	case "info":
+		return slog.LevelInfo, nil
+	case "warn":
+		return slog.LevelWarn, nil
+	case "error":
+		return slog.LevelError, nil
+	}
+	return 0, fmt.Errorf("invalid -log-level %q: want debug|info|warn|error", s)
 }
 
 // parseRAFlags detects whether IAM Roles Anywhere mode is active — any -ra-*
@@ -169,10 +199,7 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 	if err != nil {
 		return err
 	}
-	var logger *slog.Logger
-	if c.verbose {
-		logger = slog.New(slog.NewTextHandler(stderr, nil))
-	}
+	logger := newLogger(c, stderr)
 	acfg := awsclient.Config{Region: c.region, Endpoint: c.endpoint, Logger: logger}
 	if c.raMode {
 		acfg.RolesAnywhere = &awsclient.RAConfig{
@@ -190,6 +217,16 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 	}
 	_, err = fmt.Fprintln(stdout, summary)
 	return err
+}
+
+// newLogger builds the always-on logger over w, honoring the parsed -log-level
+// and -log-format flags.
+func newLogger(c *cli, w io.Writer) *slog.Logger {
+	opts := &slog.HandlerOptions{Level: c.logLevelVal}
+	if c.logFormat == "json" {
+		return slog.New(slog.NewJSONHandler(w, opts))
+	}
+	return slog.New(slog.NewTextHandler(w, opts))
 }
 
 // execute dispatches to the library and renders the one-line summary.
