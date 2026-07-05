@@ -226,8 +226,10 @@ issue_device_cert() {
 		-out "${crt}"
 	rm -f "${csr}"
 
-	# modern PKCS#12 (OpenSSL 3 defaults: AES-256 + PBKDF2, no -legacy)
-	openssl pkcs12 -export -out "${p12}" \
+	# -legacy: macOS `security import` rejects OpenSSL 3's default PKCS#12
+	# encryption (PBES2/AES-256/hmacSHA256) with "MAC verification failed";
+	# the legacy 3DES/SHA1 scheme imports on both Keychain and Windows CNG.
+	openssl pkcs12 -export -legacy -out "${p12}" \
 		-inkey "${key}" -in "${crt}" -certfile "${CA_PEM}" \
 		-name "${cn}" -passout "pass:${P12_PASS}"
 }
