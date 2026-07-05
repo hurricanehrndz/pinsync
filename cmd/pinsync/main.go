@@ -13,12 +13,9 @@ import (
 	"regexp"
 	"strings"
 
-	"github.com/aws/aws-sdk-go-v2/aws"
-	"github.com/aws/aws-sdk-go-v2/aws/arn"
-	awsconfig "github.com/aws/aws-sdk-go-v2/config"
-	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 
+	"github.com/hurricanehrndz/pinsync/pkg/awsclient"
 	"github.com/hurricanehrndz/pinsync/pkg/pull"
 	"github.com/hurricanehrndz/pinsync/pkg/push"
 	"github.com/hurricanehrndz/pinsync/pkg/rolesanywhere"
@@ -176,7 +173,14 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 	if c.verbose {
 		logger = slog.New(slog.NewTextHandler(stderr, nil))
 	}
-	client, err := newClient(ctx, c)
+	acfg := awsclient.Config{Region: c.region, Endpoint: c.endpoint, Logger: logger}
+	if c.raMode {
+		acfg.RolesAnywhere = &awsclient.RAConfig{
+			TrustAnchorARN: c.raTrustAnchor, ProfileARN: c.raProfile, RoleARN: c.raRole,
+			CertPattern: c.raRegex, CertField: c.raField, CertStore: c.raStore,
+		}
+	}
+	client, err := awsclient.NewS3(ctx, acfg)
 	if err != nil {
 		return err
 	}
@@ -207,84 +211,4 @@ func execute(ctx context.Context, c *cli, client *s3.Client, logger *slog.Logger
 	}
 	return fmt.Sprintf("pulled %d files: %d downloaded, %d linked, %d copied",
 		stats.Total, stats.Downloaded, stats.Linked, stats.Copied), nil
-}
-
-// newClient builds the S3 client. Without Roles Anywhere it resolves
-// credentials and region via the standard SDK default chain; a custom endpoint
-// (MinIO) switches to path-style addressing.
-func newClient(ctx context.Context, c *cli) (*s3.Client, error) {
-	if c.raMode {
-		return newRAClient(ctx, c)
-	}
-	var loadOpts []func(*awsconfig.LoadOptions) error
-	if c.region != "" {
-		loadOpts = append(loadOpts, awsconfig.WithRegion(c.region))
-	}
-	cfg, err := awsconfig.LoadDefaultConfig(ctx, loadOpts...)
-	if err != nil {
-		return nil, err
-	}
-	return s3.NewFromConfig(cfg, func(o *s3.Options) {
-		if c.endpoint != "" {
-			o.BaseEndpoint = aws.String(c.endpoint)
-			o.UsePathStyle = true
-		}
-	}), nil
-}
-
-// newRAClient selects the device certificate, exchanges it for temporary
-// credentials via IAM Roles Anywhere, and builds the S3 client from them. The
-// region is resolved once and shared by the CreateSession exchange and the S3
-// client so both agree; the certificate's private key never leaves its store.
-func newRAClient(ctx context.Context, c *cli) (*s3.Client, error) {
-	region, err := raRegion(c.region, c.raTrustAnchor)
-	if err != nil {
-		return nil, err
-	}
-	id, _, err := rolesanywhere.FindIdentity(c.raField, c.raRegex, c.raStore)
-	if err != nil {
-		return nil, err
-	}
-	defer id.Close()
-	creds, err := rolesanywhere.Fetch(ctx, id, rolesanywhere.Options{
-		TrustAnchorARN: c.raTrustAnchor,
-		ProfileARN:     c.raProfile,
-		RoleARN:        c.raRole,
-		Region:         region,
-	})
-	if err != nil {
-		return nil, err
-	}
-	cfg, err := awsconfig.LoadDefaultConfig(
-		ctx,
-		awsconfig.WithRegion(region),
-		awsconfig.WithCredentialsProvider(credentials.NewStaticCredentialsProvider(
-			creds.AccessKeyID, creds.SecretAccessKey, creds.SessionToken,
-		)),
-	)
-	if err != nil {
-		return nil, err
-	}
-	return s3.NewFromConfig(cfg, func(o *s3.Options) {
-		if c.endpoint != "" {
-			o.BaseEndpoint = aws.String(c.endpoint)
-			o.UsePathStyle = true
-		}
-	}), nil
-}
-
-// raRegion resolves the region for a Roles Anywhere invocation: the -region
-// flag wins, otherwise it is read from the trust anchor ARN.
-func raRegion(region, trustAnchorARN string) (string, error) {
-	if region != "" {
-		return region, nil
-	}
-	parsed, err := arn.Parse(trustAnchorARN)
-	if err != nil {
-		return "", fmt.Errorf("resolving region from -ra-trust-anchor-arn: %w", err)
-	}
-	if parsed.Region == "" {
-		return "", errors.New("no region: pass -region or use a trust anchor ARN that carries a region")
-	}
-	return parsed.Region, nil
 }
