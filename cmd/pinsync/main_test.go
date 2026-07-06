@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"flag"
 	"io"
@@ -49,6 +50,16 @@ func TestParseArgs(t *testing.T) {
 				t.Errorf("parseArgs(%v) = %v, want error containing %q", tc.args, err, tc.wantErr)
 			}
 		})
+	}
+}
+
+func TestRunVersion(t *testing.T) {
+	var out strings.Builder
+	if err := run(context.Background(), []string{"version"}, &out, io.Discard); err != nil {
+		t.Fatalf("run(version): %v", err)
+	}
+	if got := strings.TrimSpace(out.String()); got != version {
+		t.Errorf("run(version) output = %q, want %q", got, version)
 	}
 }
 

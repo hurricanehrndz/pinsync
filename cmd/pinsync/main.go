@@ -22,10 +22,15 @@ import (
 )
 
 const usage = `usage:
-  pinsync push -bucket B [flags] <root>   publish root to s3://B/<prefix>
-  pinsync pull -bucket B [flags] <dest>   mirror s3://B/<prefix> into dest
+  pinsync push    -bucket B [flags] <root>   publish root to s3://B/<prefix>
+  pinsync pull    -bucket B [flags] <dest>   mirror s3://B/<prefix> into dest
+  pinsync version                        print the pinsync version and exit
 
 run "pinsync push -h" or "pinsync pull -h" for flags`
+
+// version is the pinsync release version, managed by `go tool versionbump`
+// (see versionbump.yaml).
+const version = "0.1.0"
 
 func main() {
 	err := run(context.Background(), os.Args[1:], os.Stdout, os.Stderr)
@@ -202,6 +207,10 @@ func parseRAFlags(c *cli, fs *flag.FlagSet) error {
 }
 
 func run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
+	if len(args) > 0 && args[0] == "version" {
+		_, err := fmt.Fprintln(stdout, version)
+		return err
+	}
 	c, err := parseArgs(args, stderr)
 	if err != nil {
 		return err

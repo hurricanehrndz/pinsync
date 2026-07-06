@@ -27,5 +27,13 @@ require (
 	github.com/aws/aws-sdk-go-v2/service/sso v1.31.5 // indirect
 	github.com/aws/aws-sdk-go-v2/service/ssooidc v1.36.8 // indirect
 	github.com/aws/aws-sdk-go-v2/service/sts v1.43.5 // indirect
+	github.com/inconshreveable/mousetrap v1.1.0 // indirect
+	github.com/ptgoetz/go-versionbump v0.7.1 // indirect
+	github.com/spf13/cobra v1.10.1 // indirect
+	github.com/spf13/pflag v1.0.10 // indirect
 	golang.org/x/sys v0.45.0 // indirect
+	gopkg.in/yaml.v2 v2.4.0 // indirect
+	gopkg.in/yaml.v3 v3.0.1 // indirect
 )
+
+tool github.com/ptgoetz/go-versionbump/cmd/versionbump

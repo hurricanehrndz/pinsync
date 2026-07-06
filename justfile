@@ -48,3 +48,7 @@ build-darwin arch='arm64':
         go build -ldflags=-w -o pinsync-darwin-{{ arch }} ./cmd/pinsync
     # -ldflags=-w omits DWARF: Go's external link step otherwise shells out to
     # dsymutil to bundle debug info, which does not exist on a linux host.
+
+# bump the version, commit, and tag (patch|minor|major|...)
+bump part="patch":
+    go tool versionbump {{part}}
