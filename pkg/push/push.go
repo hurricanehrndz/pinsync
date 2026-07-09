@@ -14,6 +14,7 @@ import (
 	"path"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strings"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -32,12 +33,13 @@ type S3API interface {
 		opts ...func(*s3.Options)) (*s3.GetObjectOutput, error)
 }
 
-// Options configures Push.
+// Options configures Push and DryRun.
 type Options struct {
 	Parallel    int          // concurrent uploads; 0 means 16
 	Logger      *slog.Logger // nil means discard
 	ManifestKey string       // "" means <prefix>/manifest.json
 	Full        bool         // re-upload every file, skipping the remote-manifest diff
+	Adopt       bool         // publish only the manifest, claiming the remote tree without diffing or uploading content
 }
 
 // Stats reports what Push did (the manifest itself is not counted in Uploaded).
@@ -45,6 +47,16 @@ type Stats struct {
 	Uploaded int // content files uploaded
 	Skipped  int // content files unchanged since the remote manifest
 	Total    int // manifest entry count
+}
+
+// Plan is the read-only preview DryRun returns: what Push would do without
+// touching S3. Upload and Orphan are sorted lexically.
+type Plan struct {
+	Upload       []string // local paths that are new or changed (all paths with Full)
+	Orphan       []string // remote-manifest paths with no local counterpart
+	Unchanged    int      // local paths already up to date
+	Total        int      // local manifest entry count
+	ManifestOnly bool     // Adopt preview: only the manifest would be published
 }
 
 // goos is a test seam for the Windows guard.
@@ -58,9 +70,6 @@ var goos = runtime.GOOS
 // complete re-upload. On any failure the manifest is left untouched, so readers
 // keep the previous complete snapshot.
 func Push(ctx context.Context, client S3API, bucket, prefix, root string, opts Options) (Stats, error) {
-	if goos == "windows" {
-		return Stats{}, errors.New("push: not supported on Windows (POSIX mode bits would be synthetic)")
-	}
 	logger := opts.Logger
 	if logger == nil {
 		logger = slog.New(slog.DiscardHandler)
@@ -71,19 +80,19 @@ func Push(ctx context.Context, client S3API, bucket, prefix, root string, opts O
 	}
 	prefix = strings.TrimSuffix(prefix, "/")
 
-	m, err := manifest.Build(root)
+	m, manifestKey, mbytes, err := prepare(prefix, root, opts.ManifestKey)
 	if err != nil {
 		return Stats{}, err
 	}
 
-	manifestKey, err := resolveManifestKey(prefix, opts.ManifestKey, m.Files)
-	if err != nil {
-		return Stats{}, err
-	}
-
-	var buf bytes.Buffer
-	if err := m.Encode(&buf); err != nil {
-		return Stats{}, err
+	// Adopt claims an existing remote tree as the current snapshot by publishing
+	// only the manifest: no diff, no content loop, no GetObject.
+	if opts.Adopt {
+		if err := putManifest(ctx, client, bucket, manifestKey, mbytes); err != nil {
+			return Stats{}, err
+		}
+		logger.Info("push adopted", "files", len(m.Files), "bucket", bucket, "prefix", prefix)
+		return Stats{Skipped: len(m.Files), Total: len(m.Files)}, nil
 	}
 
 	// Diff against the remote manifest unless -full forces a complete re-upload.
@@ -93,7 +102,7 @@ func Push(ctx context.Context, client S3API, bucket, prefix, root string, opts O
 	// untouched but alter the manifest bytes — still republishes the manifest.
 	var remote map[string]string
 	if !opts.Full {
-		diffMap, noop, diffErr := remoteDiff(ctx, client, bucket, manifestKey, buf.Bytes())
+		diffMap, noop, diffErr := remoteDiff(ctx, client, bucket, manifestKey, mbytes)
 		if diffErr != nil {
 			return Stats{}, diffErr
 		}
@@ -109,18 +118,111 @@ func Push(ctx context.Context, client S3API, bucket, prefix, root string, opts O
 		return Stats{}, upErr
 	}
 
-	if _, err := client.PutObject(ctx, &s3.PutObjectInput{
-		Bucket:            aws.String(bucket),
-		Key:               aws.String(manifestKey),
-		Body:              bytes.NewReader(buf.Bytes()),
-		ChecksumAlgorithm: types.ChecksumAlgorithmSha256,
-	}); err != nil {
-		return Stats{}, fmt.Errorf("push: uploading %s: %w", manifest.Name, err)
+	if err := putManifest(ctx, client, bucket, manifestKey, mbytes); err != nil {
+		return Stats{}, err
 	}
 	uploaded := len(m.Files) - skipped
 	logger.Info("push complete", "uploaded", uploaded, "skipped", skipped,
 		"total", len(m.Files), "bucket", bucket, "prefix", prefix)
 	return Stats{Uploaded: uploaded, Skipped: skipped, Total: len(m.Files)}, nil
+}
+
+// DryRun previews what Push would do without uploading anything. It builds the
+// local manifest and applies the same Windows and collision guards as Push,
+// then — unless Adopt is set — fetches the remote manifest once to classify
+// every path as an upload (new or changed), an orphan (present remotely but
+// gone locally), or unchanged. With Full it reports every local path as an
+// upload and skips the remote fetch, so orphans are not computed. With Adopt it
+// makes no S3 calls at all, reporting only the manifest it would publish. DryRun
+// performs at most one GetObject and never a PutObject.
+func DryRun(ctx context.Context, client S3API, bucket, prefix, root string, opts Options) (Plan, error) {
+	prefix = strings.TrimSuffix(prefix, "/")
+	m, manifestKey, mbytes, err := prepare(prefix, root, opts.ManifestKey)
+	if err != nil {
+		return Plan{}, err
+	}
+	total := len(m.Files)
+
+	if opts.Adopt {
+		return Plan{Total: total, ManifestOnly: true}, nil
+	}
+	if opts.Full {
+		upload := make([]string, 0, total)
+		for _, f := range m.Files {
+			upload = append(upload, f.Path)
+		}
+		slices.Sort(upload)
+		return Plan{Upload: upload, Total: total}, nil
+	}
+
+	remote, noop, err := remoteDiff(ctx, client, bucket, manifestKey, mbytes)
+	if err != nil {
+		return Plan{}, err
+	}
+	if noop {
+		return Plan{Unchanged: total, Total: total}, nil
+	}
+	upload, orphan := classify(m.Files, remote)
+	return Plan{Upload: upload, Orphan: orphan, Unchanged: total - len(upload), Total: total}, nil
+}
+
+// prepare runs the shared Push/DryRun preamble — the Windows guard, the
+// manifest build, and the manifest-key collision guard — and returns the
+// manifest, its resolved key, and its encoded bytes. It touches no network:
+// nothing is uploaded and nothing is fetched. prefix must already be trimmed.
+func prepare(prefix, root, manifestKey string) (*manifest.Manifest, string, []byte, error) {
+	if goos == "windows" {
+		return nil, "", nil, errors.New("push: not supported on Windows (POSIX mode bits would be synthetic)")
+	}
+	m, err := manifest.Build(root)
+	if err != nil {
+		return nil, "", nil, err
+	}
+	key, err := resolveManifestKey(prefix, manifestKey, m.Files)
+	if err != nil {
+		return nil, "", nil, err
+	}
+	var buf bytes.Buffer
+	if err := m.Encode(&buf); err != nil {
+		return nil, "", nil, err
+	}
+	return m, key, buf.Bytes(), nil
+}
+
+// classify splits the local files against the remote path→SHA256 map into the
+// paths whose content would be uploaded (new or changed) and the remote paths
+// with no local counterpart (orphans), each sorted lexically. A nil remote
+// (first push) uploads every local path and yields no orphans.
+func classify(files []manifest.File, remote map[string]string) (upload, orphan []string) {
+	local := make(map[string]struct{}, len(files))
+	for _, f := range files {
+		local[f.Path] = struct{}{}
+		if remote[f.Path] != f.SHA256 {
+			upload = append(upload, f.Path)
+		}
+	}
+	for p := range remote {
+		if _, ok := local[p]; !ok {
+			orphan = append(orphan, p)
+		}
+	}
+	slices.Sort(upload)
+	slices.Sort(orphan)
+	return upload, orphan
+}
+
+// putManifest uploads the encoded manifest to manifestKey as a single-part put
+// with a full-object SHA256 checksum.
+func putManifest(ctx context.Context, client S3API, bucket, manifestKey string, mbytes []byte) error {
+	if _, err := client.PutObject(ctx, &s3.PutObjectInput{
+		Bucket:            aws.String(bucket),
+		Key:               aws.String(manifestKey),
+		Body:              bytes.NewReader(mbytes),
+		ChecksumAlgorithm: types.ChecksumAlgorithmSha256,
+	}); err != nil {
+		return fmt.Errorf("push: uploading %s: %w", manifest.Name, err)
+	}
+	return nil
 }
 
 // resolveManifestKey returns the manifest key (default <prefix>/manifest.json).

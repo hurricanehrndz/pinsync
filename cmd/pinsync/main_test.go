@@ -28,6 +28,11 @@ func TestParseArgs(t *testing.T) {
 		{"valid push", []string{"push", "-bucket", "b", "-prefix", "p", "root"}, ""},
 		{"push with full", []string{"push", "-bucket", "b", "-full", "root"}, ""},
 		{"full flag on pull rejected", []string{"pull", "-bucket", "b", "-full", "dest"}, "not defined"},
+		{"push with adopt", []string{"push", "-bucket", "b", "-adopt", "root"}, ""},
+		{"adopt with full rejected", []string{"push", "-bucket", "b", "-adopt", "-full", "root"}, "mutually exclusive"},
+		{"adopt flag on pull rejected", []string{"pull", "-bucket", "b", "-adopt", "dest"}, "not defined"},
+		{"dry-run on push", []string{"push", "-bucket", "b", "-dry-run", "root"}, ""},
+		{"dry-run on pull", []string{"pull", "-bucket", "b", "-dry-run", "dest"}, ""},
 		{"valid pull", []string{"pull", "-bucket", "b", "-endpoint-url", "http://localhost:9000", "dest"}, ""},
 		{"ra flag on push rejected", []string{"push", "-bucket", "b", "-ra-trust-anchor-arn", "arn:x", "root"}, "not defined"},
 		{"ra bad cert-field", []string{"pull", "-bucket", "b", "-ra-trust-anchor-arn", "a", "-ra-profile-arn", "p", "-ra-role-arn", "r", "-ra-cert-pattern", "x", "-ra-cert-field", "org", "dest"}, "invalid certificate field"},
@@ -64,6 +69,61 @@ func TestParseArgsFull(t *testing.T) {
 	}
 	if !c.full {
 		t.Error("full = false, want true")
+	}
+}
+
+// TestParseArgsDryRunAdopt confirms -dry-run and -adopt parse on push and land
+// on the cli struct.
+func TestParseArgsDryRunAdopt(t *testing.T) {
+	c, err := parseArgs([]string{"push", "-bucket", "b", "-dry-run", "-adopt", "root"}, io.Discard)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !c.dryRun || !c.adopt {
+		t.Errorf("dryRun=%v adopt=%v, want both true", c.dryRun, c.adopt)
+	}
+}
+
+// TestDryRunReport checks the multi-line preview: sorted upload/orphan lines
+// followed by a count summary, the "up to date" fallback when nothing is
+// pending, and the adopt preview.
+func TestDryRunReport(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		plan push.Plan
+		want string
+	}{
+		{
+			"changes",
+			push.Plan{Upload: []string{"a.txt", "d.txt"}, Orphan: []string{"b.txt"}, Unchanged: 1, Total: 3},
+			"would upload a.txt\nwould upload d.txt\nwould orphan b.txt\n" +
+				"dry-run: 2 would upload, 1 unchanged, 1 orphaned of 3 files at s3://b/p",
+		},
+		{
+			"up to date",
+			push.Plan{Unchanged: 3, Total: 3},
+			"up to date: 3 files unchanged at s3://b/p",
+		},
+		{
+			"adopt",
+			push.Plan{Total: 3, ManifestOnly: true},
+			"would adopt: publish manifest describing 3 files to s3://b/p (no content uploaded)",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := dryRunReport(tc.plan, "b", "p"); got != tc.want {
+				t.Errorf("dryRunReport =\n%q\nwant\n%q", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestAdoptSummary checks the one-line adopt result.
+func TestAdoptSummary(t *testing.T) {
+	got := adoptSummary(push.Stats{Total: 5}, "b", "p")
+	want := "adopted: published manifest for 5 files to s3://b/p (no content uploaded)"
+	if got != want {
+		t.Errorf("adoptSummary = %q, want %q", got, want)
 	}
 }
 

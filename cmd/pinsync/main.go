@@ -55,6 +55,8 @@ type cli struct {
 	dir         string
 	manifestKey string
 	full        bool
+	dryRun      bool
+	adopt       bool
 
 	// Logging flags. The raw -log-level value is parsed into logLevelVal by
 	// parseArgs so bad input fails before any store or AWS work.
@@ -100,29 +102,7 @@ func parseArgs(args []string, stderr io.Writer) (*cli, error) {
 	}
 	fs := flag.NewFlagSet("pinsync "+c.sub, flag.ContinueOnError)
 	fs.SetOutput(stderr)
-	fs.StringVar(&c.bucket, "bucket", "", "S3 bucket (required)")
-	fs.StringVar(&c.prefix, "prefix", "", "key prefix under the bucket")
-	fs.StringVar(&c.manifestKey, "manifest-key", "", "S3 key for the manifest; default <prefix>/manifest.json")
-	fs.IntVar(&c.parallel, "parallel", 16, "concurrent transfers")
-	fs.StringVar(&c.region, "region", "", "AWS region (overrides the default chain)")
-	fs.StringVar(&c.endpoint, "endpoint-url", "", "custom S3 endpoint, e.g. MinIO; implies path-style addressing")
-	fs.StringVar(&c.logLevel, "log-level", "info", "log level: debug|info|warn|error")
-	fs.StringVar(&c.logFormat, "log-format", "text", "log format: text|json")
-	// -full is a push-only override; registering it on push alone makes pull
-	// reject it as an unknown flag for free.
-	if c.sub == "push" {
-		fs.BoolVar(&c.full, "full", false, "re-upload every file, skipping the remote-manifest diff")
-	}
-	// IAM Roles Anywhere is a pull-only device flow; registering these on pull
-	// alone makes push reject them as unknown flags for free.
-	if c.sub == "pull" {
-		fs.StringVar(&c.raTrustAnchor, "ra-trust-anchor-arn", "", "IAM Roles Anywhere trust anchor ARN")
-		fs.StringVar(&c.raProfile, "ra-profile-arn", "", "IAM Roles Anywhere profile ARN")
-		fs.StringVar(&c.raRole, "ra-role-arn", "", "IAM role ARN to assume via Roles Anywhere")
-		fs.StringVar(&c.raCertPattern, "ra-cert-pattern", "", "regex selecting the device certificate by CN")
-		fs.StringVar(&c.raCertField, "ra-cert-field", "subject", "certificate CN to match: subject|issuer")
-		fs.StringVar(&c.raCertStore, "ra-cert-store", "user", "windows only: user|machine; ignored on macOS")
-	}
+	registerFlags(c, fs)
 	if err := fs.Parse(args[1:]); err != nil {
 		return nil, err
 	}
@@ -133,6 +113,11 @@ func parseArgs(args []string, stderr io.Writer) (*cli, error) {
 		return nil, fmt.Errorf("expected exactly one positional argument: the %s", posArgName(c.sub))
 	}
 	c.dir = fs.Arg(0)
+	// -adopt publishes the manifest without diffing; -full forces a full content
+	// re-upload. Asking for both is contradictory.
+	if c.adopt && c.full {
+		return nil, errors.New("-adopt and -full are mutually exclusive")
+	}
 	lvl, err := parseLogLevel(c.logLevel)
 	if err != nil {
 		return nil, err
@@ -145,6 +130,35 @@ func parseArgs(args []string, stderr io.Writer) (*cli, error) {
 		return nil, err
 	}
 	return c, nil
+}
+
+// registerFlags binds the shared flags plus the subcommand-specific ones onto
+// fs. -full/-adopt register on push and -ra-* on pull only, so the other
+// subcommand rejects them as unknown flags for free.
+func registerFlags(c *cli, fs *flag.FlagSet) {
+	fs.StringVar(&c.bucket, "bucket", "", "S3 bucket (required)")
+	fs.StringVar(&c.prefix, "prefix", "", "key prefix under the bucket")
+	fs.StringVar(&c.manifestKey, "manifest-key", "", "S3 key for the manifest; default <prefix>/manifest.json")
+	fs.IntVar(&c.parallel, "parallel", 16, "concurrent transfers")
+	fs.StringVar(&c.region, "region", "", "AWS region (overrides the default chain)")
+	fs.StringVar(&c.endpoint, "endpoint-url", "", "custom S3 endpoint, e.g. MinIO; implies path-style addressing")
+	fs.StringVar(&c.logLevel, "log-level", "info", "log level: debug|info|warn|error")
+	fs.StringVar(&c.logFormat, "log-format", "text", "log format: text|json")
+	// -dry-run is a read-only preview on both subcommands (pull support lands in
+	// a later phase); it never performs an S3 write.
+	fs.BoolVar(&c.dryRun, "dry-run", false, "preview actions without uploading or writing to S3")
+	if c.sub == "push" {
+		fs.BoolVar(&c.full, "full", false, "re-upload every file, skipping the remote-manifest diff")
+		fs.BoolVar(&c.adopt, "adopt", false, "publish only the manifest, claiming the remote tree without re-uploading content")
+	}
+	if c.sub == "pull" {
+		fs.StringVar(&c.raTrustAnchor, "ra-trust-anchor-arn", "", "IAM Roles Anywhere trust anchor ARN")
+		fs.StringVar(&c.raProfile, "ra-profile-arn", "", "IAM Roles Anywhere profile ARN")
+		fs.StringVar(&c.raRole, "ra-role-arn", "", "IAM role ARN to assume via Roles Anywhere")
+		fs.StringVar(&c.raCertPattern, "ra-cert-pattern", "", "regex selecting the device certificate by CN")
+		fs.StringVar(&c.raCertField, "ra-cert-field", "subject", "certificate CN to match: subject|issuer")
+		fs.StringVar(&c.raCertStore, "ra-cert-store", "user", "windows only: user|machine; ignored on macOS")
+	}
 }
 
 // parseLogLevel maps a -log-level string to its slog.Level.
@@ -251,16 +265,14 @@ func newLogger(c *cli, w io.Writer) *slog.Logger {
 	return slog.New(slog.NewTextHandler(w, opts))
 }
 
-// execute dispatches to the library and renders the one-line summary.
+// execute dispatches to the library and renders the summary (multi-line for a
+// dry-run preview). The returned string is printed to stdout by run.
 func execute(ctx context.Context, c *cli, client *s3.Client, logger *slog.Logger) (string, error) {
 	if c.sub == "push" {
-		stats, err := push.Push(ctx, client, c.bucket, c.prefix, c.dir, push.Options{
-			Parallel: c.parallel, Logger: logger, ManifestKey: c.manifestKey, Full: c.full,
-		})
-		if err != nil {
-			return "", err
-		}
-		return pushSummary(stats, c.bucket, c.prefix), nil
+		return executePush(ctx, c, client, logger)
+	}
+	if c.dryRun {
+		return "", errors.New("pull -dry-run is not implemented yet")
 	}
 	stats, err := pull.Pull(ctx, client, c.bucket, c.prefix, c.dir, pull.Options{
 		Parallel: c.parallel, Logger: logger, ManifestKey: c.manifestKey,
@@ -272,6 +284,30 @@ func execute(ctx context.Context, c *cli, client *s3.Client, logger *slog.Logger
 		stats.Total, stats.Downloaded, stats.Linked, stats.Copied), nil
 }
 
+// executePush runs a push, an adopt, or a read-only dry-run preview and renders
+// the corresponding summary.
+func executePush(ctx context.Context, c *cli, client *s3.Client, logger *slog.Logger) (string, error) {
+	opts := push.Options{
+		Parallel: c.parallel, Logger: logger, ManifestKey: c.manifestKey,
+		Full: c.full, Adopt: c.adopt,
+	}
+	if c.dryRun {
+		plan, err := push.DryRun(ctx, client, c.bucket, c.prefix, c.dir, opts)
+		if err != nil {
+			return "", err
+		}
+		return dryRunReport(plan, c.bucket, c.prefix), nil
+	}
+	stats, err := push.Push(ctx, client, c.bucket, c.prefix, c.dir, opts)
+	if err != nil {
+		return "", err
+	}
+	if c.adopt {
+		return adoptSummary(stats, c.bucket, c.prefix), nil
+	}
+	return pushSummary(stats, c.bucket, c.prefix), nil
+}
+
 // pushSummary renders the one-line differential push result. Uploaded==0 means
 // nothing new reached the bucket, so the tree is reported as up to date.
 func pushSummary(s push.Stats, bucket, prefix string) string {
@@ -280,4 +316,34 @@ func pushSummary(s push.Stats, bucket, prefix string) string {
 		return fmt.Sprintf("up to date: %d files unchanged at %s", s.Total, dest)
 	}
 	return fmt.Sprintf("pushed %d of %d files (%d unchanged) to %s", s.Uploaded, s.Total, s.Skipped, dest)
+}
+
+// adoptSummary renders the one-line result of a manifest-only adopt.
+func adoptSummary(s push.Stats, bucket, prefix string) string {
+	return fmt.Sprintf("adopted: published manifest for %d files to s3://%s/%s (no content uploaded)",
+		s.Total, bucket, prefix)
+}
+
+// dryRunReport renders a push dry-run preview: sorted per-file "would upload"
+// and "would orphan" lines followed by a one-line count summary. A tree with no
+// pending uploads or orphans reports "up to date"; an adopt preview reports the
+// manifest it would publish with no content uploads.
+func dryRunReport(p push.Plan, bucket, prefix string) string {
+	dest := fmt.Sprintf("s3://%s/%s", bucket, prefix)
+	if p.ManifestOnly {
+		return fmt.Sprintf("would adopt: publish manifest describing %d files to %s (no content uploaded)", p.Total, dest)
+	}
+	if len(p.Upload) == 0 && len(p.Orphan) == 0 {
+		return fmt.Sprintf("up to date: %d files unchanged at %s", p.Total, dest)
+	}
+	var b strings.Builder
+	for _, path := range p.Upload {
+		fmt.Fprintf(&b, "would upload %s\n", path)
+	}
+	for _, path := range p.Orphan {
+		fmt.Fprintf(&b, "would orphan %s\n", path)
+	}
+	fmt.Fprintf(&b, "dry-run: %d would upload, %d unchanged, %d orphaned of %d files at %s",
+		len(p.Upload), p.Unchanged, len(p.Orphan), p.Total, dest)
+	return b.String()
 }

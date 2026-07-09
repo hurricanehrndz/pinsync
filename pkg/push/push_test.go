@@ -325,6 +325,159 @@ func TestPushManifestKeyCollisionUploadsNothing(t *testing.T) {
 	}
 }
 
+// TestDryRunPreviewsChanges verifies that on a changed tree DryRun classifies
+// every path — a new file and an edited file as uploads, a deleted file as an
+// orphan, an untouched file as unchanged — sorted, while writing nothing and
+// fetching only the one remote manifest.
+func TestDryRunPreviewsChanges(t *testing.T) {
+	root := fixtureTree(t)
+	fake := s3test.NewFake()
+	pushOK(t, fake, root, push.Options{})
+	fake.ResetCalls()
+
+	writeFile(t, root, "a.txt", "alpha-edited") // changed
+	if err := os.Remove(filepath.Join(root, "b.txt")); err != nil {
+		t.Fatal(err) // deleted -> orphan
+	}
+	writeFile(t, root, "d.txt", "delta") // new
+
+	plan, err := push.DryRun(context.Background(), fake, "bkt", "cfg/prod", root, push.Options{})
+	if err != nil {
+		t.Fatalf("DryRun: %v", err)
+	}
+	if want := []string{"a.txt", "d.txt"}; !slices.Equal(plan.Upload, want) {
+		t.Errorf("Upload = %v, want %v", plan.Upload, want)
+	}
+	if want := []string{"b.txt"}; !slices.Equal(plan.Orphan, want) {
+		t.Errorf("Orphan = %v, want %v", plan.Orphan, want)
+	}
+	if plan.Unchanged != 1 || plan.Total != 3 {
+		t.Errorf("plan = %+v, want Unchanged 1 Total 3", plan)
+	}
+	// A dry-run previews; it must never upload.
+	if puts := fake.Puts(); len(puts) != 0 {
+		t.Errorf("DryRun uploaded %v, want nothing", puts)
+	}
+	// It diffs against exactly one manifest, no more.
+	if gets := fake.Gets(); len(gets) != 1 {
+		t.Errorf("DryRun made %d GetObject calls, want 1 (the manifest)", len(gets))
+	}
+}
+
+// TestDryRunUnchangedTree verifies that a byte-identical tree previews as fully
+// up to date: nothing to upload or orphan, everything unchanged.
+func TestDryRunUnchangedTree(t *testing.T) {
+	root := fixtureTree(t)
+	fake := s3test.NewFake()
+	pushOK(t, fake, root, push.Options{})
+	fake.ResetCalls()
+
+	plan, err := push.DryRun(context.Background(), fake, "bkt", "cfg/prod", root, push.Options{})
+	if err != nil {
+		t.Fatalf("DryRun: %v", err)
+	}
+	if len(plan.Upload) != 0 || len(plan.Orphan) != 0 {
+		t.Errorf("plan = %+v, want no upload/orphan", plan)
+	}
+	if plan.Unchanged != plan.Total || plan.Total != 3 {
+		t.Errorf("plan = %+v, want Unchanged==Total==3", plan)
+	}
+	if puts := fake.Puts(); len(puts) != 0 {
+		t.Errorf("DryRun uploaded %v, want nothing", puts)
+	}
+}
+
+// TestDryRunFullReportsAllUploads verifies that Full mirrors Push: every local
+// path is reported as an upload, no orphans are computed, and the remote
+// manifest is never fetched.
+func TestDryRunFullReportsAllUploads(t *testing.T) {
+	root := fixtureTree(t)
+	fake := s3test.NewFake()
+	pushOK(t, fake, root, push.Options{})
+	fake.ResetCalls()
+
+	plan, err := push.DryRun(context.Background(), fake, "bkt", "cfg/prod", root, push.Options{Full: true})
+	if err != nil {
+		t.Fatalf("DryRun: %v", err)
+	}
+	if want := []string{"a.txt", "b.txt", "sub/c.txt"}; !slices.Equal(plan.Upload, want) {
+		t.Errorf("Upload = %v, want all %v", plan.Upload, want)
+	}
+	if len(plan.Orphan) != 0 || plan.Unchanged != 0 || plan.Total != 3 {
+		t.Errorf("plan = %+v, want Orphan empty Unchanged 0 Total 3", plan)
+	}
+	if gets := fake.Gets(); len(gets) != 0 {
+		t.Errorf("full DryRun fetched %v, want no GetObject", gets)
+	}
+	if puts := fake.Puts(); len(puts) != 0 {
+		t.Errorf("DryRun uploaded %v, want nothing", puts)
+	}
+}
+
+// TestDryRunAdoptIsManifestOnly verifies that an adopt preview needs no remote
+// state: it reports ManifestOnly with the file count and makes no S3 calls.
+func TestDryRunAdoptIsManifestOnly(t *testing.T) {
+	fake := s3test.NewFake()
+	plan, err := push.DryRun(context.Background(), fake, "bkt", "cfg/prod", fixtureTree(t), push.Options{Adopt: true})
+	if err != nil {
+		t.Fatalf("DryRun: %v", err)
+	}
+	if !plan.ManifestOnly || plan.Total != 3 {
+		t.Errorf("plan = %+v, want ManifestOnly true Total 3", plan)
+	}
+	if len(plan.Upload) != 0 || len(plan.Orphan) != 0 {
+		t.Errorf("plan = %+v, want no upload/orphan", plan)
+	}
+	if len(fake.Puts()) != 0 || len(fake.Gets()) != 0 {
+		t.Errorf("adopt DryRun made S3 calls: puts=%v gets=%v", fake.Puts(), fake.Gets())
+	}
+}
+
+// TestPushAdoptPublishesManifestOnly verifies that adopt uploads exactly the
+// manifest — no content, no diff GetObject — and reports every file skipped.
+func TestPushAdoptPublishesManifestOnly(t *testing.T) {
+	fake := s3test.NewFake()
+	stats := pushOK(t, fake, fixtureTree(t), push.Options{Adopt: true})
+
+	if stats.Uploaded != 0 || stats.Skipped != 3 || stats.Total != 3 {
+		t.Errorf("stats = %+v, want {Uploaded:0 Skipped:3 Total:3}", stats)
+	}
+	if puts := fake.Puts(); !slices.Equal(puts, []string{"cfg/prod/manifest.json"}) {
+		t.Errorf("puts = %v, want only the manifest", puts)
+	}
+	if gets := fake.Gets(); len(gets) != 0 {
+		t.Errorf("adopt fetched %v, want no GetObject (it does not diff)", gets)
+	}
+	body, ok := fake.Object("cfg/prod/manifest.json")
+	if !ok {
+		t.Fatal("manifest not published")
+	}
+	m, err := manifest.Decode(strings.NewReader(string(body)))
+	if err != nil {
+		t.Fatalf("published manifest does not decode: %v", err)
+	}
+	if len(m.Files) != 3 {
+		t.Errorf("manifest lists %d files, want 3", len(m.Files))
+	}
+}
+
+// TestPushAdoptCollisionUploadsNothing verifies that the collision guard still
+// applies in adopt mode: a manifest key naming a content file is rejected up
+// front, so nothing lands.
+func TestPushAdoptCollisionUploadsNothing(t *testing.T) {
+	root := t.TempDir()
+	writeFile(t, root, "site.json", "payload")
+	fake := s3test.NewFake()
+	_, err := push.Push(context.Background(), fake, "bkt", "cfg/prod", root,
+		push.Options{Adopt: true, ManifestKey: "cfg/prod/site.json"})
+	if err == nil {
+		t.Fatal("adopt accepted a manifest key colliding with a content file")
+	}
+	if puts := fake.Puts(); len(puts) != 0 {
+		t.Errorf("adopt uploaded despite the collision: %v", puts)
+	}
+}
+
 func TestPushRejectsInvalidTreeBeforeUploading(t *testing.T) {
 	root := t.TempDir()
 	writeFile(t, root, "manifest.json", "{}") // reserved top-level name
