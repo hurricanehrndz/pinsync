@@ -272,7 +272,13 @@ func execute(ctx context.Context, c *cli, client *s3.Client, logger *slog.Logger
 		return executePush(ctx, c, client, logger)
 	}
 	if c.dryRun {
-		return "", errors.New("pull -dry-run is not implemented yet")
+		plan, err := pull.DryRun(ctx, client, c.bucket, c.prefix, c.dir, pull.Options{
+			Parallel: c.parallel, Logger: logger, ManifestKey: c.manifestKey,
+		})
+		if err != nil {
+			return "", err
+		}
+		return pullDryRunReport(plan, c.dir), nil
 	}
 	stats, err := pull.Pull(ctx, client, c.bucket, c.prefix, c.dir, pull.Options{
 		Parallel: c.parallel, Logger: logger, ManifestKey: c.manifestKey,
@@ -345,5 +351,27 @@ func dryRunReport(p push.Plan, bucket, prefix string) string {
 	}
 	fmt.Fprintf(&b, "dry-run: %d would upload, %d unchanged, %d orphaned of %d files at %s",
 		len(p.Upload), p.Unchanged, len(p.Orphan), p.Total, dest)
+	return b.String()
+}
+
+// pullDryRunReport renders a pull dry-run preview: sorted per-file "would
+// download" / "would copy" / "would remove" lines followed by a one-line count
+// summary. A tree already matching the manifest reports "up to date".
+func pullDryRunReport(p pull.Plan, dest string) string {
+	if len(p.Download) == 0 && len(p.Copy) == 0 && len(p.Remove) == 0 {
+		return fmt.Sprintf("up to date: %d files unchanged at %s", p.Total, dest)
+	}
+	var b strings.Builder
+	for _, path := range p.Download {
+		fmt.Fprintf(&b, "would download %s\n", path)
+	}
+	for _, path := range p.Copy {
+		fmt.Fprintf(&b, "would copy %s\n", path)
+	}
+	for _, path := range p.Remove {
+		fmt.Fprintf(&b, "would remove %s\n", path)
+	}
+	fmt.Fprintf(&b, "dry-run: would pull %d files: %d download, %d copy, %d unchanged; %d would be removed",
+		p.Total, len(p.Download), len(p.Copy), p.Linked, len(p.Remove))
 	return b.String()
 }

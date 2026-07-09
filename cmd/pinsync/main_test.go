@@ -9,6 +9,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/hurricanehrndz/pinsync/pkg/pull"
 	"github.com/hurricanehrndz/pinsync/pkg/push"
 	"github.com/hurricanehrndz/pinsync/pkg/rolesanywhere"
 )
@@ -113,6 +114,38 @@ func TestDryRunReport(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			if got := dryRunReport(tc.plan, "b", "p"); got != tc.want {
 				t.Errorf("dryRunReport =\n%q\nwant\n%q", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestPullDryRunReport checks the multi-line pull preview: sorted
+// download/copy/remove lines followed by a count summary, and the "up to date"
+// fallback when the tree already matches the manifest.
+func TestPullDryRunReport(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		plan pull.Plan
+		want string
+	}{
+		{
+			"changes",
+			pull.Plan{
+				Download: []string{"a.txt", "d.txt"}, Copy: []string{"c.txt"},
+				Remove: []string{"b.txt"}, Linked: 1, Total: 4,
+			},
+			"would download a.txt\nwould download d.txt\nwould copy c.txt\nwould remove b.txt\n" +
+				"dry-run: would pull 4 files: 2 download, 1 copy, 1 unchanged; 1 would be removed",
+		},
+		{
+			"up to date",
+			pull.Plan{Linked: 3, Total: 3},
+			"up to date: 3 files unchanged at /dest",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := pullDryRunReport(tc.plan, "/dest"); got != tc.want {
+				t.Errorf("pullDryRunReport =\n%q\nwant\n%q", got, tc.want)
 			}
 		})
 	}

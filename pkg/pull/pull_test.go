@@ -8,8 +8,10 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	"log/slog"
 	"os"
 	"path/filepath"
+	"reflect"
 	"runtime"
 	"strings"
 	"testing"
@@ -524,6 +526,170 @@ func TestPullManifestKeyCustomLocation(t *testing.T) {
 	}
 	assertTree(t, dest, files)
 	assertNoLeftovers(t, dest)
+}
+
+// snapshot records every regular file under root as "content|mode", so a
+// before/after comparison proves DryRun touched neither a byte nor a bit.
+func snapshot(t *testing.T, root string) map[string]string {
+	t.Helper()
+	snap := map[string]string{}
+	err := filepath.WalkDir(root, func(p string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if d.IsDir() || !d.Type().IsRegular() {
+			return nil
+		}
+		rel, err := filepath.Rel(root, p)
+		if err != nil {
+			return err
+		}
+		body, err := os.ReadFile(p)
+		if err != nil {
+			return err
+		}
+		info, err := d.Info()
+		if err != nil {
+			return err
+		}
+		snap[filepath.ToSlash(rel)] = fmt.Sprintf("%s|%04o", body, info.Mode().Perm())
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return snap
+}
+
+// warnLogger returns a logger writing Warn+ records to buf, for asserting the
+// interrupted-pull warning without touching stdout.
+func warnLogger(buf *bytes.Buffer) *slog.Logger {
+	return slog.New(slog.NewTextHandler(buf, &slog.HandlerOptions{Level: slog.LevelWarn}))
+}
+
+// TestDryRunClassifiesAndIsReadOnly checks the four outcomes (download a
+// content change, copy a mode-only change, count an unchanged file as Linked,
+// remove an extra local file), that only the manifest is fetched, that no
+// staging trees appear, and that dest is left byte- and mode-for-mode intact.
+func TestDryRunClassifiesAndIsReadOnly(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("mode-only changes are not meaningful on Windows (L3); push is POSIX-only (P1)")
+	}
+	fake := s3test.NewFake()
+	files := map[string]string{"a.txt": "alpha", "b.txt": "bravo", "c.txt": "charlie"}
+	pushFixture(t, fake, files)
+	dest := filepath.Join(t.TempDir(), "dest")
+	mustPull(t, fake, dest)
+
+	// Mutate the live tree: change b's content, c's mode only, add an extra.
+	if err := os.WriteFile(filepath.Join(dest, "b.txt"), []byte("changed"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(filepath.Join(dest, "c.txt"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	writeFile(t, dest, "extra.txt", "junk", 0o644)
+
+	before := snapshot(t, dest)
+	fake.ResetCalls()
+
+	plan, err := pull.DryRun(context.Background(), fake, "bkt", prefix, dest, pull.Options{})
+	if err != nil {
+		t.Fatalf("DryRun: %v", err)
+	}
+	if !reflect.DeepEqual(plan.Download, []string{"b.txt"}) {
+		t.Errorf("Download = %v, want [b.txt]", plan.Download)
+	}
+	if !reflect.DeepEqual(plan.Copy, []string{"c.txt"}) {
+		t.Errorf("Copy = %v, want [c.txt]", plan.Copy)
+	}
+	if !reflect.DeepEqual(plan.Remove, []string{"extra.txt"}) {
+		t.Errorf("Remove = %v, want [extra.txt]", plan.Remove)
+	}
+	if plan.Linked != 1 || plan.Total != 3 {
+		t.Errorf("plan = %+v, want Linked=1 Total=3", plan)
+	}
+
+	// Only the manifest was fetched — no content GetObject.
+	for _, key := range fake.Gets() {
+		if key != manifestKey {
+			t.Errorf("DryRun fetched %q; want the manifest only", key)
+		}
+	}
+
+	assertNoLeftovers(t, dest) // no .pinsync-tmp / .pinsync-old created
+
+	if after := snapshot(t, dest); !reflect.DeepEqual(after, before) {
+		t.Errorf("DryRun mutated dest:\n before %v\n after  %v", before, after)
+	}
+}
+
+// TestDryRunWarnsOnInterruptedPull checks that leftover crash state (dest gone,
+// .pinsync-old present) draws the interrupted-pull warning to the logger,
+// reports every entry as a download (the live tree is empty), and mutates
+// nothing — the old tree stays and dest stays absent.
+func TestDryRunWarnsOnInterruptedPull(t *testing.T) {
+	fake := s3test.NewFake()
+	files := map[string]string{"a.txt": "alpha", "b.txt": "bravo"}
+	pushFixture(t, fake, files)
+	dest := filepath.Join(t.TempDir(), "dest")
+	mustPull(t, fake, dest)
+
+	// Crash between the swap's two renames: dest missing, old present.
+	old := dest + ".pinsync-old"
+	if err := os.Rename(dest, old); err != nil {
+		t.Fatal(err)
+	}
+
+	var logs bytes.Buffer
+	plan, err := pull.DryRun(context.Background(), fake, "bkt", prefix, dest,
+		pull.Options{Logger: warnLogger(&logs)})
+	if err != nil {
+		t.Fatalf("DryRun: %v", err)
+	}
+	if !strings.Contains(logs.String(), "interrupted") {
+		t.Errorf("no interrupted-pull warning logged; got %q", logs.String())
+	}
+	if !reflect.DeepEqual(plan.Download, []string{"a.txt", "b.txt"}) {
+		t.Errorf("Download = %v, want [a.txt b.txt]", plan.Download)
+	}
+	if plan.Linked != 0 || plan.Total != 2 || len(plan.Copy) != 0 || len(plan.Remove) != 0 {
+		t.Errorf("plan = %+v, want 2 downloads only", plan)
+	}
+	if _, err := os.Lstat(old); err != nil {
+		t.Errorf(".pinsync-old was mutated by a read-only preview: %v", err)
+	}
+	if _, err := os.Lstat(dest); err == nil {
+		t.Error("dest was created by a read-only preview")
+	}
+}
+
+// TestDryRunFirstPull checks the empty/missing-dest case: every entry is a
+// download, nothing is copied or removed, and no interrupted-pull warning fires.
+func TestDryRunFirstPull(t *testing.T) {
+	fake := s3test.NewFake()
+	files := map[string]string{"a.txt": "alpha", "sub/b.txt": "bravo"}
+	pushFixture(t, fake, files)
+	dest := filepath.Join(t.TempDir(), "dest") // does not exist yet
+
+	var logs bytes.Buffer
+	plan, err := pull.DryRun(context.Background(), fake, "bkt", prefix, dest,
+		pull.Options{Logger: warnLogger(&logs)})
+	if err != nil {
+		t.Fatalf("DryRun: %v", err)
+	}
+	if !reflect.DeepEqual(plan.Download, []string{"a.txt", "sub/b.txt"}) {
+		t.Errorf("Download = %v, want [a.txt sub/b.txt]", plan.Download)
+	}
+	if plan.Total != 2 || plan.Linked != 0 || len(plan.Copy) != 0 || len(plan.Remove) != 0 {
+		t.Errorf("plan = %+v, want 2 downloads only", plan)
+	}
+	if logs.Len() != 0 {
+		t.Errorf("first pull logged a warning: %q", logs.String())
+	}
+	if _, err := os.Lstat(dest); err == nil {
+		t.Error("dest was created by a read-only preview")
+	}
 }
 
 func TestPullRejectsInvalidManifestBeforeTouchingDest(t *testing.T) {

@@ -62,12 +62,43 @@ func (s *syncer) stage(ctx context.Context, m *manifest.Manifest, live map[strin
 	}, nil
 }
 
+// action is how one manifest entry is reconciled against the live tree.
+type action int
+
+const (
+	actDownload action = iota // live file is absent or its content differs
+	actCopy                   // content matches but the mode does not (never on Windows)
+	actLink                   // content and mode match; hardlink the live file
+)
+
+// classify decides, without touching the filesystem, how a manifest entry
+// should be staged against the live tree, and returns the parsed target mode.
+// It is the single decision shared by real staging and the dry-run preview:
+// download when the live file is absent or its content differs, copy on a
+// mode-only change (modes are not meaningful on Windows, so skipped there),
+// otherwise hardlink. The hardlink→copy runtime fallback is the stager's, not
+// classify's — classify reports only the intended action.
+func classify(f manifest.File, live map[string]localFile) (action, fs.FileMode, error) {
+	mode, err := f.FileMode()
+	if err != nil {
+		return 0, 0, err
+	}
+	lf, ok := live[f.Path]
+	if !ok || lf.hash != f.SHA256 {
+		return actDownload, mode, nil
+	}
+	if goos != "windows" && lf.mode != mode {
+		return actCopy, mode, nil
+	}
+	return actLink, mode, nil
+}
+
 // stageEntry stages one manifest entry: hardlink when content and mode match
 // the live file (content only on Windows), copy locally on a mode-only
 // change (never hardlink-then-chmod, which would mutate the live inode), and
 // download otherwise. Hardlink failures fall back to a copy.
 func (s *syncer) stageEntry(ctx context.Context, f manifest.File, live map[string]localFile, c *counters) error {
-	mode, err := f.FileMode()
+	act, mode, err := classify(f, live)
 	if err != nil {
 		return err
 	}
@@ -75,8 +106,7 @@ func (s *syncer) stageEntry(ctx context.Context, f manifest.File, live map[strin
 	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
 		return err
 	}
-	lf, ok := live[f.Path]
-	if !ok || lf.hash != f.SHA256 {
+	if act == actDownload {
 		if err := s.download(ctx, f, dst, mode); err != nil {
 			return err
 		}
@@ -84,7 +114,7 @@ func (s *syncer) stageEntry(ctx context.Context, f manifest.File, live map[strin
 		return nil
 	}
 	src := filepath.Join(s.dest, filepath.FromSlash(f.Path))
-	if goos != "windows" && lf.mode != mode {
+	if act == actCopy {
 		if err := copyFile(src, dst, mode); err != nil {
 			return err
 		}
