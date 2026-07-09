@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -68,6 +69,157 @@ func TestPushUploadsManifestLast(t *testing.T) {
 	}
 	if len(m.Files) != 3 {
 		t.Errorf("manifest lists %d files, want 3", len(m.Files))
+	}
+}
+
+// pushOK runs Push into fake and fails the test on error, returning the stats.
+func pushOK(t *testing.T, fake *s3test.Fake, root string, opts push.Options) push.Stats {
+	t.Helper()
+	stats, err := push.Push(context.Background(), fake, "bkt", "cfg/prod", root, opts)
+	if err != nil {
+		t.Fatalf("Push: %v", err)
+	}
+	return stats
+}
+
+// TestPushUploadsOnlyChangedFiles verifies the differential path: after an
+// initial push, editing one file re-uploads exactly that file plus the
+// manifest last — untouched files are not re-sent.
+func TestPushUploadsOnlyChangedFiles(t *testing.T) {
+	root := fixtureTree(t)
+	fake := s3test.NewFake()
+	pushOK(t, fake, root, push.Options{})
+	before := len(fake.Puts())
+
+	writeFile(t, root, "a.txt", "alpha-edited")
+	stats := pushOK(t, fake, root, push.Options{})
+
+	if stats.Uploaded != 1 || stats.Skipped != 2 || stats.Total != 3 {
+		t.Errorf("stats = %+v, want {Uploaded:1 Skipped:2 Total:3}", stats)
+	}
+	got := fake.Puts()[before:]
+	want := []string{"cfg/prod/a.txt", "cfg/prod/manifest.json"}
+	if !slices.Equal(got, want) {
+		t.Errorf("second-push puts = %v, want %v", got, want)
+	}
+}
+
+// TestPushUnchangedTreeIsNoop verifies that re-pushing an identical tree
+// uploads nothing at all — not even the manifest — and reports everything
+// skipped.
+func TestPushUnchangedTreeIsNoop(t *testing.T) {
+	root := fixtureTree(t)
+	fake := s3test.NewFake()
+	pushOK(t, fake, root, push.Options{})
+	before := len(fake.Puts())
+
+	stats := pushOK(t, fake, root, push.Options{})
+
+	if got := fake.Puts()[before:]; len(got) != 0 {
+		t.Errorf("no-op push uploaded %v, want nothing", got)
+	}
+	if stats.Uploaded != 0 || stats.Skipped != 3 || stats.Total != 3 {
+		t.Errorf("stats = %+v, want {Uploaded:0 Skipped:3 Total:3}", stats)
+	}
+}
+
+// TestPushMetadataChangeRepublishesManifest verifies that changes leaving all
+// content bytes untouched — a mode-only edit or a deletion — upload zero
+// content but still re-publish the manifest, since the atomic-snapshot pointer
+// itself changed.
+func TestPushMetadataChangeRepublishesManifest(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		mutate func(t *testing.T, root string)
+	}{
+		{"chmod", func(t *testing.T, root string) {
+			if err := os.Chmod(filepath.Join(root, "a.txt"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+		}},
+		{"delete", func(t *testing.T, root string) {
+			if err := os.Remove(filepath.Join(root, "a.txt")); err != nil {
+				t.Fatal(err)
+			}
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			root := fixtureTree(t)
+			fake := s3test.NewFake()
+			pushOK(t, fake, root, push.Options{})
+			before := len(fake.Puts())
+
+			tc.mutate(t, root)
+			stats := pushOK(t, fake, root, push.Options{})
+
+			got := fake.Puts()[before:]
+			want := []string{"cfg/prod/manifest.json"}
+			if !slices.Equal(got, want) {
+				t.Errorf("puts = %v, want only the manifest %v", got, want)
+			}
+			if stats.Uploaded != 0 {
+				t.Errorf("Uploaded = %d, want 0 content uploads", stats.Uploaded)
+			}
+		})
+	}
+}
+
+// TestPushFullReuploadsUnchangedTree verifies that -full bypasses the diff:
+// every content file plus the manifest is re-sent even when nothing changed.
+func TestPushFullReuploadsUnchangedTree(t *testing.T) {
+	root := fixtureTree(t)
+	fake := s3test.NewFake()
+	pushOK(t, fake, root, push.Options{})
+	before := len(fake.Puts())
+	beforeGets := len(fake.Gets())
+
+	stats := pushOK(t, fake, root, push.Options{Full: true})
+
+	if got := fake.Puts()[before:]; len(got) != 4 {
+		t.Errorf("full re-push uploaded %v, want 3 content files + manifest", got)
+	}
+	if stats.Uploaded != 3 || stats.Skipped != 0 || stats.Total != 3 {
+		t.Errorf("stats = %+v, want {Uploaded:3 Skipped:0 Total:3}", stats)
+	}
+	// -full must never fetch the remote manifest to diff against.
+	if gets := fake.Gets()[beforeGets:]; len(gets) != 0 {
+		t.Errorf("full push fetched %v, want no GetObject", gets)
+	}
+}
+
+// TestPushFirstPushUploadsAll verifies that a NoSuchKey on the remote manifest
+// (no prior snapshot) is treated as a first push: everything is uploaded.
+func TestPushFirstPushUploadsAll(t *testing.T) {
+	fake := s3test.NewFake()
+	stats := pushOK(t, fake, fixtureTree(t), push.Options{})
+	if stats.Uploaded != 3 || stats.Total != 3 {
+		t.Errorf("stats = %+v, want all 3 uploaded", stats)
+	}
+	if len(fake.Puts()) != 4 {
+		t.Errorf("puts = %v, want 3 content files + manifest", fake.Puts())
+	}
+}
+
+// TestPushRemoteManifestFetchErrorIsFatal verifies that a remote-manifest
+// fetch failure that is not NoSuchKey aborts the push (rather than silently
+// re-uploading everything) and the error points at -full.
+func TestPushRemoteManifestFetchErrorIsFatal(t *testing.T) {
+	root := fixtureTree(t)
+	fake := s3test.NewFake()
+	// Seed a corrupt manifest at the default key so the diff fetch decodes into
+	// an error — a valid "other error" distinct from NoSuchKey.
+	fake.Store("cfg/prod/manifest.json", []byte("{not json"))
+
+	_, err := push.Push(context.Background(), fake, "bkt", "cfg/prod", root, push.Options{})
+	if err == nil {
+		t.Fatal("Push succeeded despite an unreadable remote manifest")
+	}
+	if !strings.Contains(err.Error(), "-full") {
+		t.Errorf("error %q does not mention -full", err)
+	}
+	// The abort happens before any upload.
+	if puts := fake.Puts(); len(puts) != 0 {
+		t.Errorf("Push uploaded despite the fetch error: %v", puts)
 	}
 }
 

@@ -132,6 +132,16 @@ func (f *Fake) Object(key string) ([]byte, bool) {
 	return body, ok
 }
 
+// ResetCalls forgets the recorded PutObject/GetObject order, so a caller can
+// seed the store as an arrange step and then observe only the calls its act
+// makes. Stored objects and fault hooks are left in place.
+func (f *Fake) ResetCalls() {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.putOrder = nil
+	f.getOrder = nil
+}
+
 // Puts returns every attempted PutObject key in call order.
 func (f *Fake) Puts() []string {
 	f.mu.Lock()

@@ -43,9 +43,12 @@ func writeFile(t *testing.T, root, rel, content string, perm fs.FileMode) {
 // pushFixture publishes files (all 0644) through the real push path into the
 // fake, so pull tests consume exactly what push produces. Push is POSIX-only
 // (P1), so on Windows the fake is seeded with the same bytes push would have
-// produced; push↔pull interop stays covered by the POSIX runs.
+// produced; push↔pull interop stays covered by the POSIX runs. The recorded
+// call history is reset afterward so this arrange step — including push's own
+// remote-manifest diff fetch — is invisible to tests that observe the pull.
 func pushFixture(t *testing.T, fake *s3test.Fake, files map[string]string) {
 	t.Helper()
+	defer fake.ResetCalls()
 	if runtime.GOOS == "windows" {
 		for rel, content := range files {
 			fake.Store(prefix+"/"+rel, []byte(content))

@@ -9,6 +9,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/hurricanehrndz/pinsync/pkg/push"
 	"github.com/hurricanehrndz/pinsync/pkg/rolesanywhere"
 )
 
@@ -25,6 +26,8 @@ func TestParseArgs(t *testing.T) {
 		{"pull missing positional", []string{"pull", "-bucket", "b"}, "destination directory"},
 		{"extra positional", []string{"pull", "-bucket", "b", "d1", "d2"}, "exactly one"},
 		{"valid push", []string{"push", "-bucket", "b", "-prefix", "p", "root"}, ""},
+		{"push with full", []string{"push", "-bucket", "b", "-full", "root"}, ""},
+		{"full flag on pull rejected", []string{"pull", "-bucket", "b", "-full", "dest"}, "not defined"},
 		{"valid pull", []string{"pull", "-bucket", "b", "-endpoint-url", "http://localhost:9000", "dest"}, ""},
 		{"ra flag on push rejected", []string{"push", "-bucket", "b", "-ra-trust-anchor-arn", "arn:x", "root"}, "not defined"},
 		{"ra bad cert-field", []string{"pull", "-bucket", "b", "-ra-trust-anchor-arn", "a", "-ra-profile-arn", "p", "-ra-role-arn", "r", "-ra-cert-pattern", "x", "-ra-cert-field", "org", "dest"}, "invalid certificate field"},
@@ -48,6 +51,36 @@ func TestParseArgs(t *testing.T) {
 			}
 			if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
 				t.Errorf("parseArgs(%v) = %v, want error containing %q", tc.args, err, tc.wantErr)
+			}
+		})
+	}
+}
+
+// TestParseArgsFull confirms -full parses on push and lands on the cli struct.
+func TestParseArgsFull(t *testing.T) {
+	c, err := parseArgs([]string{"push", "-bucket", "b", "-full", "root"}, io.Discard)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !c.full {
+		t.Error("full = false, want true")
+	}
+}
+
+// TestPushSummary checks the differential summary renders the changed count and
+// falls back to an "up to date" line when nothing was uploaded.
+func TestPushSummary(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		stats push.Stats
+		want  string
+	}{
+		{"partial", push.Stats{Uploaded: 2, Skipped: 3, Total: 5}, "pushed 2 of 5 files (3 unchanged) to s3://b/p"},
+		{"noop", push.Stats{Uploaded: 0, Skipped: 5, Total: 5}, "up to date: 5 files unchanged at s3://b/p"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := pushSummary(tc.stats, "b", "p"); got != tc.want {
+				t.Errorf("pushSummary = %q, want %q", got, tc.want)
 			}
 		})
 	}

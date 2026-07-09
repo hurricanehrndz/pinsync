@@ -54,6 +54,7 @@ type cli struct {
 	parallel    int
 	dir         string
 	manifestKey string
+	full        bool
 
 	// Logging flags. The raw -log-level value is parsed into logLevelVal by
 	// parseArgs so bad input fails before any store or AWS work.
@@ -107,6 +108,11 @@ func parseArgs(args []string, stderr io.Writer) (*cli, error) {
 	fs.StringVar(&c.endpoint, "endpoint-url", "", "custom S3 endpoint, e.g. MinIO; implies path-style addressing")
 	fs.StringVar(&c.logLevel, "log-level", "info", "log level: debug|info|warn|error")
 	fs.StringVar(&c.logFormat, "log-format", "text", "log format: text|json")
+	// -full is a push-only override; registering it on push alone makes pull
+	// reject it as an unknown flag for free.
+	if c.sub == "push" {
+		fs.BoolVar(&c.full, "full", false, "re-upload every file, skipping the remote-manifest diff")
+	}
 	// IAM Roles Anywhere is a pull-only device flow; registering these on pull
 	// alone makes push reject them as unknown flags for free.
 	if c.sub == "pull" {
@@ -249,12 +255,12 @@ func newLogger(c *cli, w io.Writer) *slog.Logger {
 func execute(ctx context.Context, c *cli, client *s3.Client, logger *slog.Logger) (string, error) {
 	if c.sub == "push" {
 		stats, err := push.Push(ctx, client, c.bucket, c.prefix, c.dir, push.Options{
-			Parallel: c.parallel, Logger: logger, ManifestKey: c.manifestKey,
+			Parallel: c.parallel, Logger: logger, ManifestKey: c.manifestKey, Full: c.full,
 		})
 		if err != nil {
 			return "", err
 		}
-		return fmt.Sprintf("pushed %d files to s3://%s/%s", stats.Uploaded, c.bucket, c.prefix), nil
+		return pushSummary(stats, c.bucket, c.prefix), nil
 	}
 	stats, err := pull.Pull(ctx, client, c.bucket, c.prefix, c.dir, pull.Options{
 		Parallel: c.parallel, Logger: logger, ManifestKey: c.manifestKey,
@@ -264,4 +270,14 @@ func execute(ctx context.Context, c *cli, client *s3.Client, logger *slog.Logger
 	}
 	return fmt.Sprintf("pulled %d files: %d downloaded, %d linked, %d copied",
 		stats.Total, stats.Downloaded, stats.Linked, stats.Copied), nil
+}
+
+// pushSummary renders the one-line differential push result. Uploaded==0 means
+// nothing new reached the bucket, so the tree is reported as up to date.
+func pushSummary(s push.Stats, bucket, prefix string) string {
+	dest := fmt.Sprintf("s3://%s/%s", bucket, prefix)
+	if s.Uploaded == 0 {
+		return fmt.Sprintf("up to date: %d files unchanged at %s", s.Total, dest)
+	}
+	return fmt.Sprintf("pushed %d of %d files (%d unchanged) to %s", s.Uploaded, s.Total, s.Skipped, dest)
 }
