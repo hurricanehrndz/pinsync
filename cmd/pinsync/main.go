@@ -12,10 +12,12 @@ import (
 	"os"
 	"regexp"
 	"strings"
+	"time"
 
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 
 	"github.com/hurricanehrndz/pinsync/pkg/awsclient"
+	"github.com/hurricanehrndz/pinsync/pkg/prune"
 	"github.com/hurricanehrndz/pinsync/pkg/pull"
 	"github.com/hurricanehrndz/pinsync/pkg/push"
 	"github.com/hurricanehrndz/pinsync/pkg/rolesanywhere"
@@ -24,9 +26,10 @@ import (
 const usage = `usage:
   pinsync push    -bucket B [flags] <root>   publish root to s3://B/<prefix>
   pinsync pull    -bucket B [flags] <dest>   mirror s3://B/<prefix> into dest
+  pinsync prune   -bucket B [flags]          delete unreferenced objects under s3://B/<prefix>
   pinsync version                        print the pinsync version and exit
 
-run "pinsync push -h" or "pinsync pull -h" for flags`
+run "pinsync push -h", "pinsync pull -h", or "pinsync prune -h" for flags`
 
 // version is the pinsync release version, managed by `go tool versionbump`
 // (see versionbump.yaml).
@@ -57,6 +60,8 @@ type cli struct {
 	full        bool
 	dryRun      bool
 	adopt       bool
+	minAge      time.Duration
+	apply       bool
 
 	// Logging flags. The raw -log-level value is parsed into logLevelVal by
 	// parseArgs so bad input fails before any store or AWS work.
@@ -97,7 +102,7 @@ func parseArgs(args []string, stderr io.Writer) (*cli, error) {
 		return nil, errors.New("missing subcommand\n" + usage)
 	}
 	c := &cli{sub: args[0]}
-	if c.sub != "push" && c.sub != "pull" {
+	if c.sub != "push" && c.sub != "pull" && c.sub != "prune" {
 		return nil, fmt.Errorf("unknown subcommand %q\n%s", c.sub, usage)
 	}
 	fs := flag.NewFlagSet("pinsync "+c.sub, flag.ContinueOnError)
@@ -109,10 +114,9 @@ func parseArgs(args []string, stderr io.Writer) (*cli, error) {
 	if c.bucket == "" {
 		return nil, errors.New("-bucket is required")
 	}
-	if fs.NArg() != 1 {
-		return nil, fmt.Errorf("expected exactly one positional argument: the %s", posArgName(c.sub))
+	if err := parsePositional(c, fs); err != nil {
+		return nil, err
 	}
-	c.dir = fs.Arg(0)
 	// -adopt publishes the manifest without diffing; -full forces a full content
 	// re-upload. Asking for both is contradictory.
 	if c.adopt && c.full {
@@ -132,6 +136,22 @@ func parseArgs(args []string, stderr io.Writer) (*cli, error) {
 	return c, nil
 }
 
+// parsePositional validates the positional arguments: prune takes none, while
+// push/pull each require exactly one, stored as the local dir.
+func parsePositional(c *cli, fs *flag.FlagSet) error {
+	if c.sub == "prune" {
+		if fs.NArg() != 0 {
+			return fmt.Errorf("prune takes no positional argument, got %q", fs.Arg(0))
+		}
+		return nil
+	}
+	if fs.NArg() != 1 {
+		return fmt.Errorf("expected exactly one positional argument: the %s", posArgName(c.sub))
+	}
+	c.dir = fs.Arg(0)
+	return nil
+}
+
 // registerFlags binds the shared flags plus the subcommand-specific ones onto
 // fs. -full/-adopt register on push and -ra-* on pull only, so the other
 // subcommand rejects them as unknown flags for free.
@@ -144,20 +164,25 @@ func registerFlags(c *cli, fs *flag.FlagSet) {
 	fs.StringVar(&c.endpoint, "endpoint-url", "", "custom S3 endpoint, e.g. MinIO; implies path-style addressing")
 	fs.StringVar(&c.logLevel, "log-level", "info", "log level: debug|info|warn|error")
 	fs.StringVar(&c.logFormat, "log-format", "text", "log format: text|json")
-	// -dry-run is a read-only preview on both subcommands (pull support lands in
-	// a later phase); it never performs an S3 write.
-	fs.BoolVar(&c.dryRun, "dry-run", false, "preview actions without uploading or writing to S3")
 	if c.sub == "push" {
+		// -dry-run is a read-only preview; it never performs an S3 write.
+		fs.BoolVar(&c.dryRun, "dry-run", false, "preview actions without uploading or writing to S3")
 		fs.BoolVar(&c.full, "full", false, "re-upload every file, skipping the remote-manifest diff")
 		fs.BoolVar(&c.adopt, "adopt", false, "publish only the manifest, claiming the remote tree without re-uploading content")
 	}
 	if c.sub == "pull" {
+		// -dry-run is a read-only preview; it never performs an S3 write.
+		fs.BoolVar(&c.dryRun, "dry-run", false, "preview actions without uploading or writing to S3")
 		fs.StringVar(&c.raTrustAnchor, "ra-trust-anchor-arn", "", "IAM Roles Anywhere trust anchor ARN")
 		fs.StringVar(&c.raProfile, "ra-profile-arn", "", "IAM Roles Anywhere profile ARN")
 		fs.StringVar(&c.raRole, "ra-role-arn", "", "IAM role ARN to assume via Roles Anywhere")
 		fs.StringVar(&c.raCertPattern, "ra-cert-pattern", "", "regex selecting the device certificate by CN")
 		fs.StringVar(&c.raCertField, "ra-cert-field", "subject", "certificate CN to match: subject|issuer")
 		fs.StringVar(&c.raCertStore, "ra-cert-store", "user", "windows only: user|machine; ignored on macOS")
+	}
+	if c.sub == "prune" {
+		fs.DurationVar(&c.minAge, "min-age", 24*time.Hour, "protect objects modified within this window from deletion")
+		fs.BoolVar(&c.apply, "apply", false, "delete unreferenced objects; without it prune only previews")
 	}
 }
 
@@ -271,6 +296,9 @@ func execute(ctx context.Context, c *cli, client *s3.Client, logger *slog.Logger
 	if c.sub == "push" {
 		return executePush(ctx, c, client, logger)
 	}
+	if c.sub == "prune" {
+		return executePrune(ctx, c, client, logger)
+	}
 	if c.dryRun {
 		plan, err := pull.DryRun(ctx, client, c.bucket, c.prefix, c.dir, pull.Options{
 			Parallel: c.parallel, Logger: logger, ManifestKey: c.manifestKey,
@@ -312,6 +340,24 @@ func executePush(ctx context.Context, c *cli, client *s3.Client, logger *slog.Lo
 		return adoptSummary(stats, c.bucket, c.prefix), nil
 	}
 	return pushSummary(stats, c.bucket, c.prefix), nil
+}
+
+// executePrune previews (default) or applies (-apply) a prune of unreferenced
+// objects and renders the corresponding summary.
+func executePrune(ctx context.Context, c *cli, client *s3.Client, logger *slog.Logger) (string, error) {
+	opts := prune.Options{ManifestKey: c.manifestKey, MinAge: c.minAge, Logger: logger}
+	if !c.apply {
+		plan, err := prune.DryRun(ctx, client, c.bucket, c.prefix, opts)
+		if err != nil {
+			return "", err
+		}
+		return pruneDryRunReport(plan, c.bucket, c.prefix), nil
+	}
+	stats, err := prune.Prune(ctx, client, c.bucket, c.prefix, opts)
+	if err != nil {
+		return "", err
+	}
+	return pruneSummary(stats, c.bucket, c.prefix), nil
 }
 
 // pushSummary renders the one-line differential push result. Uploaded==0 means
@@ -374,4 +420,34 @@ func pullDryRunReport(p pull.Plan, dest string) string {
 	fmt.Fprintf(&b, "dry-run: would pull %d files: %d download, %d copy, %d unchanged; %d would be removed",
 		p.Total, len(p.Download), len(p.Copy), p.Linked, len(p.Remove))
 	return b.String()
+}
+
+// pruneDryRunReport renders a prune dry-run preview: sorted "would delete" lines
+// followed by a one-line count summary. A prefix with nothing to delete reports
+// "nothing to prune".
+func pruneDryRunReport(p prune.Plan, bucket, prefix string) string {
+	dest := fmt.Sprintf("s3://%s/%s", bucket, prefix)
+	if len(p.Delete) == 0 {
+		return fmt.Sprintf("nothing to prune: %d objects at %s (%d referenced, %d protected)",
+			p.Listed, dest, p.Referenced, p.Protected)
+	}
+	var b strings.Builder
+	for _, key := range p.Delete {
+		fmt.Fprintf(&b, "would delete %s\n", key)
+	}
+	fmt.Fprintf(&b, "prune: would delete %d of %d objects (%d referenced, %d protected by -min-age) at %s",
+		len(p.Delete), p.Listed, p.Referenced, p.Protected, dest)
+	return b.String()
+}
+
+// pruneSummary renders the one-line prune result. Deleted==0 means nothing was
+// unreferenced past the grace window, so the prefix is reported as clean.
+func pruneSummary(s prune.Stats, bucket, prefix string) string {
+	dest := fmt.Sprintf("s3://%s/%s", bucket, prefix)
+	if s.Deleted == 0 {
+		return fmt.Sprintf("nothing to prune: %d objects at %s (%d referenced, %d protected)",
+			s.Listed, dest, s.Referenced, s.Protected)
+	}
+	return fmt.Sprintf("pruned: deleted %d of %d objects (%d referenced, %d protected by -min-age) at %s",
+		s.Deleted, s.Listed, s.Referenced, s.Protected, dest)
 }
