@@ -8,7 +8,9 @@ import (
 	"log/slog"
 	"strings"
 	"testing"
+	"time"
 
+	"github.com/hurricanehrndz/pinsync/pkg/prune"
 	"github.com/hurricanehrndz/pinsync/pkg/pull"
 	"github.com/hurricanehrndz/pinsync/pkg/push"
 	"github.com/hurricanehrndz/pinsync/pkg/rolesanywhere"
@@ -34,6 +36,8 @@ func TestParseArgs(t *testing.T) {
 		{"adopt flag on pull rejected", []string{"pull", "-bucket", "b", "-adopt", "dest"}, "not defined"},
 		{"dry-run on push", []string{"push", "-bucket", "b", "-dry-run", "root"}, ""},
 		{"dry-run on pull", []string{"pull", "-bucket", "b", "-dry-run", "dest"}, ""},
+		{"prune rejects positional", []string{"prune", "-bucket", "b", "extra"}, "no positional argument"},
+		{"prune rejects dry-run", []string{"prune", "-bucket", "b", "-dry-run"}, "not defined"},
 		{"valid pull", []string{"pull", "-bucket", "b", "-endpoint-url", "http://localhost:9000", "dest"}, ""},
 		{"ra flag on push rejected", []string{"push", "-bucket", "b", "-ra-trust-anchor-arn", "arn:x", "root"}, "not defined"},
 		{"ra bad cert-field", []string{"pull", "-bucket", "b", "-ra-trust-anchor-arn", "a", "-ra-profile-arn", "p", "-ra-role-arn", "r", "-ra-cert-pattern", "x", "-ra-cert-field", "org", "dest"}, "invalid certificate field"},
@@ -82,6 +86,88 @@ func TestParseArgsDryRunAdopt(t *testing.T) {
 	}
 	if !c.dryRun || !c.adopt {
 		t.Errorf("dryRun=%v adopt=%v, want both true", c.dryRun, c.adopt)
+	}
+}
+
+// TestParseArgsPrune confirms prune parses with no positional and lands its
+// flags on the cli struct: -min-age defaults to 24h and takes a custom
+// duration, -apply toggles the delete.
+func TestParseArgsPrune(t *testing.T) {
+	c, err := parseArgs([]string{"prune", "-bucket", "b"}, io.Discard)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.minAge != 24*time.Hour {
+		t.Errorf("minAge = %v, want default 24h", c.minAge)
+	}
+	if c.apply {
+		t.Error("apply = true, want default false")
+	}
+
+	c, err = parseArgs([]string{"prune", "-bucket", "b", "-min-age", "90m", "-apply"}, io.Discard)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.minAge != 90*time.Minute {
+		t.Errorf("minAge = %v, want 90m", c.minAge)
+	}
+	if !c.apply {
+		t.Error("apply = false, want true")
+	}
+}
+
+// TestPruneDryRunReport checks the prune preview: sorted "would delete" lines
+// followed by a count summary, and the "nothing to prune" fallback.
+func TestPruneDryRunReport(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		plan prune.Plan
+		want string
+	}{
+		{
+			"deletions",
+			prune.Plan{Delete: []string{"a", "c"}, Referenced: 5, Protected: 2, Listed: 9},
+			"would delete a\nwould delete c\n" +
+				"prune: would delete 2 of 9 objects (5 referenced, 2 protected by -min-age) at s3://b/p",
+		},
+		{
+			"nothing to prune",
+			prune.Plan{Referenced: 5, Protected: 2, Listed: 7},
+			"nothing to prune: 7 objects at s3://b/p (5 referenced, 2 protected)",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := pruneDryRunReport(tc.plan, "b", "p"); got != tc.want {
+				t.Errorf("pruneDryRunReport =\n%q\nwant\n%q", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestPruneSummary checks the applied prune summary and its "nothing to prune"
+// fallback when no object was deleted.
+func TestPruneSummary(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		stats prune.Stats
+		want  string
+	}{
+		{
+			"deleted",
+			prune.Stats{Deleted: 2, Referenced: 5, Protected: 2, Listed: 9},
+			"pruned: deleted 2 of 9 objects (5 referenced, 2 protected by -min-age) at s3://b/p",
+		},
+		{
+			"nothing to prune",
+			prune.Stats{Referenced: 7, Listed: 7},
+			"nothing to prune: 7 objects at s3://b/p (7 referenced, 0 protected)",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := pruneSummary(tc.stats, "b", "p"); got != tc.want {
+				t.Errorf("pruneSummary = %q, want %q", got, tc.want)
+			}
+		})
 	}
 }
 
