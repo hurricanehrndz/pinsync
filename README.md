@@ -40,6 +40,32 @@ pinsync pull -bucket my-bucket -prefix cfg/prod /etc/myapp
 Common flags: `-parallel N` (default 16), `-region`, `-endpoint-url`
 (e.g. MinIO; enables path-style addressing), `-v` (progress logging).
 
+## Prune
+
+```sh
+pinsync prune -bucket my-bucket -prefix cfg/prod -apply
+```
+
+`prune` deletes objects under the prefix that the published `manifest.json` no
+longer references — snapshot garbage left behind when a push changes or removes
+files. It previews by default (listing what it *would* delete and touching
+nothing); pass `-apply` to actually delete.
+
+`-min-age` (default `24h`) protects any object modified within the window from
+deletion. This closes the push race: a concurrent push uploads content first
+and publishes the manifest last, so freshly uploaded objects are briefly absent
+from the reference set — the grace window keeps them until the manifest catches
+up.
+
+A missing or corrupt manifest is fatal: prune refuses to delete rather than
+treat "no reference set" as "everything is orphan".
+
+**Slow-pull residual caveat:** a pull slow enough to still be mirroring a
+snapshot that a newer push has already superseded can have the objects it is
+reading deleted out from under it once they age past `-min-age`. This is bounded
+by the threshold and deliberately left uncoordinated in code — raise `-min-age`
+if your slowest pull can exceed the default.
+
 ## Credentials
 
 By default credentials resolve via the standard AWS SDK default chain, in
@@ -85,3 +111,8 @@ import "github.com/hurricanehrndz/pinsync/pkg/pull"
 
 stats, err := pull.Pull(ctx, s3Client, bucket, prefix, dest, pull.Options{})
 ```
+
+`push` and `prune` are importable the same way
+(`github.com/hurricanehrndz/pinsync/pkg/push`,
+`github.com/hurricanehrndz/pinsync/pkg/prune`); `prune` also exposes `DryRun`
+for the preview.
