@@ -7,7 +7,7 @@ import (
 	"bytes"
 	"context"
 	"io"
-	"sort"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -158,7 +158,7 @@ func (f *Fake) ListObjectsV2(_ context.Context, in *s3.ListObjectsV2Input, _ ...
 			keys = append(keys, k)
 		}
 	}
-	sort.Strings(keys)
+	slices.Sort(keys)
 
 	truncated := len(keys) > max
 	if truncated {
