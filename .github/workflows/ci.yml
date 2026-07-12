@@ -14,7 +14,7 @@ jobs:
       - name: Install MinIO (integration tests spawn it; no AWS involved)
         run: |
           mkdir -p "$HOME/.local/bin"
-          curl -sSfL https://dl.min.io/server/minio/release/linux-amd64/archive/minio.RELEASE.2025-10-15T17-29-55Z \
+          curl -sSfL https://dl.min.io/server/minio/release/linux-amd64/archive/minio.RELEASE.2025-09-07T16-13-09Z \
             -o "$HOME/.local/bin/minio"
           chmod +x "$HOME/.local/bin/minio"
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
