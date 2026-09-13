@@ -21,3 +21,6 @@ files: # The files to update with the new version (i.e. "Tracked files").
   - path: "cmd/pinsync/main.go"
     replace:
       - 'const version = "{version}"'
+  - path: "embala.toml"
+    replace:
+      - 'version = "{version}"'

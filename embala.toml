@@ -1,0 +1,24 @@
+[package]
+name = "pinsync"
+display-name = "pinsync"
+version = "0.1.0"
+identifier = "com.github.hurricanehrndz.pinsync"
+publisher = "hurricanehrndz"
+description = "S3 syncing CLI with manifest validation"
+homepage = "https://github.com/hurricanehrndz/pinsync"
+
+# The MSI is deliberately unsigned. It installs pinsync under Program Files.
+[msi]
+arch = "x86_64"
+main-executable = "pinsync.exe"
+files = [{ src = "dist/pinsync-windows-x86_64.exe", dest = "pinsync.exe" }]
+
+# One universal binary keeps the signed package usable on Intel and Apple silicon.
+[pkg]
+install-location = "/usr/local"
+files = [{ src = "dist/pinsync-darwin-universal", dest = "bin/pinsync" }]
+
+# The release workflow supplies these paths. embala invokes rcodesign after it
+# builds the package, so the installer signature covers the finished XAR.
+[sign.macos]
+command = "rcodesign sign --p12-file \"$MACOS_INSTALLER_P12\" --p12-password-file \"$MACOS_INSTALLER_P12_PASSWORD_FILE\" $f"
