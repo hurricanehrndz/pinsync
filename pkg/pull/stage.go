@@ -23,15 +23,17 @@ import (
 // linkFn is a test seam for forcing hardlink failures.
 var linkFn = os.Link
 
-// hashMismatchError marks a downloaded object whose bytes do not match the
-// manifest — the one error class that triggers a full re-sync attempt.
-type hashMismatchError struct {
-	Path      string
-	Want, Got string
+// stagedMismatchError marks staged bytes whose hash or length does not match
+// the manifest entry — the one error class that triggers a full re-sync
+// attempt (an object overwritten mid-publish can differ in either). Detail
+// says which.
+type stagedMismatchError struct {
+	Path   string
+	Detail string
 }
 
-func (e *hashMismatchError) Error() string {
-	return fmt.Sprintf("pull: %s: downloaded bytes hash %s, manifest says %s", e.Path, e.Got, e.Want)
+func (e *stagedMismatchError) Error() string {
+	return fmt.Sprintf("pull: %s: %s", e.Path, e.Detail)
 }
 
 // counters aggregates per-entry outcomes across the staging workers.
@@ -66,7 +68,7 @@ func (s *syncer) stage(ctx context.Context, m *manifest.Manifest, live map[strin
 type action int
 
 const (
-	actDownload action = iota // live file is absent or its content differs
+	actDownload action = iota // live file is absent or its content or size differs
 	actCopy                   // content matches but the mode does not (never on Windows)
 	actLink                   // content and mode match; hardlink the live file
 )
@@ -74,7 +76,7 @@ const (
 // classify decides, without touching the filesystem, how a manifest entry
 // should be staged against the live tree, and returns the parsed target mode.
 // It is the single decision shared by real staging and the dry-run preview:
-// download when the live file is absent or its content differs, copy on a
+// download when the live file is absent or its content or size differs, copy on a
 // mode-only change (modes are not meaningful on Windows, so skipped there),
 // otherwise hardlink. The hardlink→copy runtime fallback is the stager's, not
 // classify's — classify reports only the intended action.
@@ -84,7 +86,7 @@ func classify(f manifest.File, live map[string]localFile) (action, fs.FileMode, 
 		return 0, 0, err
 	}
 	lf, ok := live[f.Path]
-	if !ok || lf.hash != f.SHA256 {
+	if !ok || lf.hash != f.SHA256 || lf.size != f.Size {
 		return actDownload, mode, nil
 	}
 	if goos != "windows" && lf.mode != mode {
@@ -107,7 +109,7 @@ func (s *syncer) stageEntry(ctx context.Context, f manifest.File, live map[strin
 		return err
 	}
 	if act == actDownload {
-		if err := s.download(ctx, f, dst, mode); err != nil {
+		if err := s.fetch(ctx, f, dst, mode); err != nil {
 			return err
 		}
 		c.downloaded.Add(1)
@@ -115,7 +117,7 @@ func (s *syncer) stageEntry(ctx context.Context, f manifest.File, live map[strin
 	}
 	src := filepath.Join(s.dest, filepath.FromSlash(f.Path))
 	if act == actCopy {
-		if err := copyFile(src, dst, mode); err != nil {
+		if err := copyFile(src, f, dst, mode); err != nil {
 			return err
 		}
 		c.copied.Add(1)
@@ -123,7 +125,7 @@ func (s *syncer) stageEntry(ctx context.Context, f manifest.File, live map[strin
 	}
 	if err := linkFn(src, dst); err != nil {
 		s.logger.Debug("hardlink failed; copying instead", "path", f.Path, "error", err)
-		if err := copyFile(src, dst, mode); err != nil {
+		if err := copyFile(src, f, dst, mode); err != nil {
 			return err
 		}
 		c.copied.Add(1)
@@ -134,8 +136,7 @@ func (s *syncer) stageEntry(ctx context.Context, f manifest.File, live map[strin
 }
 
 // download fetches one object whole (never ranged — a full-object checksum
-// needs full-object bytes), streams it into the staging file while hashing,
-// and independently verifies it against the manifest entry.
+// needs full-object bytes) and writes it into staging with writeVerified.
 func (s *syncer) download(ctx context.Context, f manifest.File, dst string, mode fs.FileMode) error {
 	key := path.Join(s.prefix, f.Path)
 	out, err := s.client.GetObject(ctx, &s3.GetObjectInput{
@@ -147,44 +148,77 @@ func (s *syncer) download(ctx context.Context, f manifest.File, dst string, mode
 		return fmt.Errorf("pull: fetching %s: %w", key, err)
 	}
 	defer func() { _ = out.Body.Close() }()
-
-	fh, err := os.OpenFile(dst, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, mode)
-	if err != nil {
-		return err
-	}
-	h := sha256.New()
-	if _, err := io.Copy(fh, io.TeeReader(out.Body, h)); err != nil {
-		_ = fh.Close()
+	if err := writeVerified(out.Body, f, dst, mode); err != nil {
 		return fmt.Errorf("pull: downloading %s: %w", key, err)
 	}
-	if err := fh.Close(); err != nil {
-		return err
-	}
-	if got := hex.EncodeToString(h.Sum(nil)); got != f.SHA256 {
-		return &hashMismatchError{Path: f.Path, Want: f.SHA256, Got: got}
-	}
-	return chmod(dst, mode)
+	return nil
 }
 
-// copyFile copies src into the staging tree with the manifest's mode.
-func copyFile(src, dst string, mode fs.FileMode) error {
+// copyFromSource stages one entry from ReplaceFromDirectory's source tree.
+// The source file must be a regular file; its bytes are verified like a
+// download.
+func (s *syncer) copyFromSource(_ context.Context, f manifest.File, dst string, mode fs.FileMode) error {
+	src := filepath.Join(s.source, filepath.FromSlash(f.Path))
+	info, err := os.Lstat(src)
+	if err != nil {
+		return fmt.Errorf("pull: source %s: %w", f.Path, err)
+	}
+	if !info.Mode().IsRegular() {
+		return fmt.Errorf("pull: source %s: not a regular file", f.Path)
+	}
 	in, err := os.Open(src)
 	if err != nil {
 		return err
 	}
 	defer func() { _ = in.Close() }() // read-only; nothing to do about a close error
-	out, err := os.OpenFile(dst, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, mode)
+	if err := writeVerified(in, f, dst, mode); err != nil {
+		return fmt.Errorf("pull: copying source %s: %w", f.Path, err)
+	}
+	return nil
+}
+
+// writeVerified streams r into the staging file dst while hashing, reading at
+// most one byte past the declared size, and verifies length and SHA256
+// against the manifest entry. A long body fails without being read to EOF.
+func writeVerified(r io.Reader, f manifest.File, dst string, mode fs.FileMode) error {
+	fh, err := os.OpenFile(dst, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, mode)
 	if err != nil {
 		return err
 	}
-	if _, err := io.Copy(out, in); err != nil {
-		_ = out.Close()
+	h := sha256.New()
+	n, err := io.Copy(fh, io.TeeReader(io.LimitReader(r, f.Size+1), h))
+	if err != nil {
+		_ = fh.Close()
 		return err
 	}
-	if err := out.Close(); err != nil {
+	if err := fh.Close(); err != nil {
 		return err
+	}
+	switch {
+	case n > f.Size:
+		return &stagedMismatchError{Path: f.Path, Detail: fmt.Sprintf("body exceeds the manifest's %d bytes", f.Size)}
+	case n < f.Size:
+		return &stagedMismatchError{Path: f.Path, Detail: fmt.Sprintf("body is %d bytes, manifest says %d", n, f.Size)}
+	}
+	if got := hex.EncodeToString(h.Sum(nil)); got != f.SHA256 {
+		return &stagedMismatchError{Path: f.Path, Detail: fmt.Sprintf("bytes hash %s, manifest says %s", got, f.SHA256)}
 	}
 	return chmod(dst, mode)
+}
+
+// copyFile copies the live file src into the staging tree with
+// writeVerified, so a live file that changed since it was hashed is never
+// read past the entry's declared size.
+func copyFile(src string, f manifest.File, dst string, mode fs.FileMode) error {
+	in, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = in.Close() }() // read-only; nothing to do about a close error
+	if err := writeVerified(in, f, dst, mode); err != nil {
+		return fmt.Errorf("pull: copying live %s: %w", f.Path, err)
+	}
+	return nil
 }
 
 // chmod applies the exact permission bits; on Windows modes are not

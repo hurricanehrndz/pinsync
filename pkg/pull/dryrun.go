@@ -2,8 +2,6 @@ package pull
 
 import (
 	"context"
-	"log/slog"
-	"path/filepath"
 	"slices"
 	"strings"
 )
@@ -26,18 +24,11 @@ type Plan struct {
 // pull is reported as a warning rather than repaired, so the preview may be
 // inaccurate until the next real pull recovers.
 func DryRun(ctx context.Context, client S3API, bucket, prefix, dest string, opts Options) (Plan, error) {
-	s := &syncer{
-		client:      client,
-		bucket:      bucket,
-		prefix:      strings.TrimSuffix(prefix, "/"),
-		dest:        filepath.Clean(dest),
-		logger:      opts.Logger,
-		manifestKey: opts.ManifestKey,
+	s, err := newSyncer(dest, opts)
+	if err != nil {
+		return Plan{}, err
 	}
-	if s.logger == nil {
-		s.logger = slog.New(slog.DiscardHandler)
-	}
-	s.tmp, s.old = s.dest+tmpSuffix, s.dest+oldSuffix
+	s.client, s.bucket, s.prefix = client, bucket, strings.TrimSuffix(prefix, "/")
 
 	// Mirror recoverInterrupted's trigger conditions without acting on them: a
 	// stale staging tree or a leftover old tree both mean a previous pull was
@@ -47,7 +38,7 @@ func DryRun(ctx context.Context, client S3API, bucket, prefix, dest string, opts
 			"tmp", s.tmp, "old", s.old)
 	}
 
-	m, err := s.fetchManifest(ctx)
+	_, m, err := s.fetchManifest(ctx)
 	if err != nil {
 		return Plan{}, err
 	}

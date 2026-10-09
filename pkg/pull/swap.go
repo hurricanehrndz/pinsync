@@ -8,6 +8,9 @@ import (
 	"time"
 )
 
+// renameFn is a test seam for interrupting the swap between its renames.
+var renameFn = os.Rename
+
 // swapBackoff is the initial pause between rename retries; it doubles per
 // attempt. A test seam.
 var swapBackoff = 100 * time.Millisecond
@@ -26,7 +29,7 @@ func (s *syncer) swap() error {
 	}
 	if err := s.renameRetry(s.tmp, s.dest); err != nil {
 		if destExisted {
-			if rbErr := os.Rename(s.old, s.dest); rbErr != nil {
+			if rbErr := renameFn(s.old, s.dest); rbErr != nil {
 				return errors.Join(err, fmt.Errorf(
 					"pull: rolling %s back also failed (the next pull will recover it): %w", s.dest, rbErr,
 				))
@@ -50,7 +53,7 @@ func (s *syncer) renameRetry(from, to string) error {
 	backoff := swapBackoff
 	var err error
 	for attempt := 1; attempt <= s.swapAttempts; attempt++ {
-		if err = os.Rename(from, to); err == nil {
+		if err = renameFn(from, to); err == nil {
 			return nil
 		}
 		if attempt < s.swapAttempts {

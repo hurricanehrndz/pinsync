@@ -112,6 +112,39 @@ import "github.com/hurricanehrndz/pinsync/pkg/pull"
 stats, err := pull.Pull(ctx, s3Client, bucket, prefix, dest, pull.Options{})
 ```
 
+### Manifest persistence and offline repair
+
+Callers that must remember which manifest describes an installed tree use
+`PullWithManifest`, which returns the exact manifest bytes it installed.
+`Options.BeforeReplace` receives a copy of those bytes after the staged tree is
+verified and before the new swap; returning an error prevents the swap and
+leaves the recovered destination unchanged. Recovery of an interrupted earlier
+swap runs first, so it may already have renamed the destination's siblings
+before the callback runs. Only a staged-content mismatch (hash or size) seen
+before `BeforeReplace` is retried (refetching the manifest); nothing is retried
+after it.
+
+```go
+res, err := pull.PullWithManifest(ctx, s3Client, bucket, prefix, dest, pull.Options{
+    BeforeReplace: func(ctx context.Context, m []byte) error { return savePending(m) },
+})
+// res.Manifest describes dest; res.Stats is what Pull returns.
+```
+
+- `pull.Recover(ctx, dest, logger)` finishes or rolls back an interrupted swap
+  from the local `dest`, `dest.pinsync-tmp` and `dest.pinsync-old` alone; it
+  never promotes the unverified staging tree.
+- `pull.ReplaceFromDirectory(ctx, source, dest, manifestBytes, opts)` installs
+  the tree described by `manifestBytes` from a local directory, with the same
+  verification, callback, swap and recovery. It only reads `source`.
+- `manifest.VerifyTree(ctx, root, m)` checks that `root` holds exactly `m`'s
+  files (hash, size, and mode except on Windows) and nothing else; symlinks
+  and other non-regular files fail.
+
+`Options.MaxManifestBytes` (default 64 MiB) caps the manifest read and
+`Options.MaxContentBytes` (default 64 GiB) caps the manifest's total declared
+size; zero means the default and a negative limit is an error. Each body is read to at most its declared size plus one byte.
+
 `push` and `prune` are importable the same way
 (`github.com/hurricanehrndz/pinsync/pkg/push`,
 `github.com/hurricanehrndz/pinsync/pkg/prune`); `prune` also exposes `DryRun`
