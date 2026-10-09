@@ -95,3 +95,24 @@ func TestValidateAggregatesViolations(t *testing.T) {
 		}
 	}
 }
+
+func TestValidateRejectsEntryFields(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		f    manifest.File
+	}{
+		{"short digest", manifest.File{Path: "a", SHA256: "deadbeef", Size: 1, Mode: "0644"}},
+		{"uppercase digest", manifest.File{Path: "a", SHA256: strings.Repeat("A", 64), Size: 1, Mode: "0644"}},
+		{"non-hex digest", manifest.File{Path: "a", SHA256: strings.Repeat("g", 64), Size: 1, Mode: "0644"}},
+		{"negative size", manifest.File{Path: "a", SHA256: hashA, Size: -1, Mode: "0644"}},
+		{"setuid mode", manifest.File{Path: "a", SHA256: hashA, Size: 1, Mode: "04755"}},
+		{"garbage mode", manifest.File{Path: "a", SHA256: hashA, Size: 1, Mode: "rw"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			m := &manifest.Manifest{Version: 1, Files: []manifest.File{tc.f}}
+			if err := m.Validate(); err == nil {
+				t.Errorf("Validate accepted %+v", tc.f)
+			}
+		})
+	}
+}

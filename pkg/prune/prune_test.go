@@ -21,7 +21,7 @@ func manifestBody(t *testing.T, paths ...string) []byte {
 	t.Helper()
 	m := manifest.Manifest{Version: manifest.Version}
 	for _, p := range paths {
-		m.Files = append(m.Files, manifest.File{Path: p, SHA256: "deadbeef", Size: 1, Mode: "0644"})
+		m.Files = append(m.Files, manifest.File{Path: p, SHA256: strings.Repeat("d", 64), Size: 1, Mode: "0644"})
 	}
 	var buf bytes.Buffer
 	if err := m.Encode(&buf); err != nil {
