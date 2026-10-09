@@ -1,21 +1,16 @@
 name: Release
-
 on:
   push:
     tags: ["v*"]
   workflow_dispatch:
-
 permissions:
   contents: read
-
 concurrency:
   group: release-${{ github.ref }}
   cancel-in-progress: false
-
 env:
-  EMBALA_VERSION: 0.1.0
+  EMBALA_VERSION: 0.3.0
   APPLE_CODESIGN_VERSION: 0.29.0
-
 jobs:
   meta:
     runs-on: ubuntu-latest
@@ -40,7 +35,6 @@ jobs:
             exit 1
           fi
           echo "version=$version" >> "$GITHUB_OUTPUT"
-
   verify:
     runs-on: ubuntu-latest
     steps:
@@ -57,7 +51,6 @@ jobs:
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
       - run: go vet ./...
       - run: go test -tags integration ./...
-
   linux:
     needs: [meta, verify]
     runs-on: ubuntu-latest
@@ -82,7 +75,6 @@ jobs:
           name: linux-release
           path: pinsync-*-linux-x86_64.tar.gz
           if-no-files-found: error
-
   windows:
     needs: [meta, verify]
     runs-on: ubuntu-latest
@@ -102,7 +94,6 @@ jobs:
           name: windows-payload
           path: staging/pinsync-windows-x86_64.exe
           if-no-files-found: error
-
   macos:
     needs: [meta, verify]
     runs-on: macos-latest
@@ -128,7 +119,6 @@ jobs:
           name: macos-payload
           path: staging/pinsync-darwin-universal
           if-no-files-found: error
-
   installers:
     needs: [meta, windows, macos]
     runs-on: macos-latest
@@ -233,7 +223,6 @@ jobs:
             release/*.msi
             release/*.pkg
           if-no-files-found: error
-
   release:
     needs: [meta, linux, installers]
     if: github.ref_type == 'tag'
