@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"net"
 	"net/http"
-	"os"
 	"os/exec"
 	"testing"
 	"time"
@@ -22,25 +21,26 @@ const (
 	minioPassword = "pinsync-secret"
 )
 
-// StartMinIO execs a `minio server` on an ephemeral port backed by a test
-// temp dir and returns an S3 client pointed at it (path-style, static test
-// credentials). The server is killed on test cleanup. Skips the test with a
-// clear message if the minio binary is not on PATH.
+// StartMinIO execs a `rustfs server` (an S3-compatible server that replaced
+// MinIO here; the name is kept for its callers) on an ephemeral port backed by
+// a test temp dir and returns an S3 client pointed at it (path-style, static
+// test credentials). The server is killed on test cleanup. Skips the test with
+// a clear message if the rustfs binary is not on PATH.
 func StartMinIO(t *testing.T) *s3.Client {
 	t.Helper()
-	bin, err := exec.LookPath("minio")
+	bin, err := exec.LookPath("rustfs")
 	if err != nil {
-		t.Skip("minio binary not on PATH (provided by devenv); skipping integration test")
+		t.Skip("rustfs binary not on PATH (provided by devenv); skipping integration test")
 	}
 	addr := freeAddr(t)
-	cmd := exec.Command(bin, "server", "--address", addr, "--quiet", t.TempDir())
-	cmd.Env = append(
-		os.Environ(),
-		"MINIO_ROOT_USER="+minioUser,
-		"MINIO_ROOT_PASSWORD="+minioPassword,
+	cmd := exec.Command(bin, "server",
+		"--address", addr,
+		"--access-key", minioUser,
+		"--secret-key", minioPassword,
+		t.TempDir(),
 	)
 	if err := cmd.Start(); err != nil {
-		t.Fatalf("starting minio: %v", err)
+		t.Fatalf("starting rustfs: %v", err)
 	}
 	t.Cleanup(func() {
 		_ = cmd.Process.Kill()
@@ -79,10 +79,10 @@ func freeAddr(t *testing.T) string {
 	return addr
 }
 
-// waitLive polls the MinIO health endpoint until the server accepts requests.
+// waitLive polls the rustfs health endpoint until the server accepts requests.
 func waitLive(t *testing.T, addr string) {
 	t.Helper()
-	url := fmt.Sprintf("http://%s/minio/health/live", addr)
+	url := fmt.Sprintf("http://%s/health/live", addr)
 	deadline := time.Now().Add(30 * time.Second)
 	for time.Now().Before(deadline) {
 		resp, err := http.Get(url)
@@ -94,5 +94,5 @@ func waitLive(t *testing.T, addr string) {
 		}
 		time.Sleep(100 * time.Millisecond)
 	}
-	t.Fatalf("minio at %s did not become ready within 30s", addr)
+	t.Fatalf("rustfs at %s did not become ready within 30s", addr)
 }
