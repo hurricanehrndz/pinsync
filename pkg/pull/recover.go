@@ -1,10 +1,29 @@
 package pull
 
 import (
+	"context"
 	"fmt"
 	"log/slog"
 	"os"
+	"path/filepath"
 )
+
+// Recover finishes or rolls back a swap interrupted by a crash, using only
+// dest and its .pinsync-tmp and .pinsync-old siblings — no S3 client and no
+// source. Afterwards dest is either the tree from before the interrupted
+// replacement or the fully swapped-in new one (a crash after both renames),
+// and no sibling remains. It never promotes the unverified staging tree.
+// Pull, PullWithManifest, and ReplaceFromDirectory run it first themselves.
+func Recover(ctx context.Context, dest string, logger *slog.Logger) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if logger == nil {
+		logger = slog.New(slog.DiscardHandler)
+	}
+	dest = filepath.Clean(dest)
+	return recoverInterrupted(dest, dest+tmpSuffix, dest+oldSuffix, logger)
+}
 
 // recoverInterrupted applies the crash-recovery rules before any sync work.
 // With a live dest, stale staging/old trees from an interrupted pull are

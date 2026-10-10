@@ -6,16 +6,25 @@ import (
 	"strings"
 )
 
-// Validate checks every entry against the schema's path rules: well-formed
-// relative slash-separated paths, no two paths differing only in case
-// (default APFS and NTFS are case-insensitive), and Windows compatibility
-// (no reserved device names, no components ending in a dot or space). All
-// violations are aggregated into a single error so callers report everything
-// at once.
+// Validate checks every entry against the schema's rules: a lowercase hex
+// SHA256, a nonnegative size, permission-only mode bits, well-formed relative
+// slash-separated paths, no two paths differing only in case (default APFS
+// and NTFS are case-insensitive), and Windows compatibility (no reserved
+// device names, no components ending in a dot or space). All violations are
+// aggregated into a single error so callers report everything at once.
 func (m *Manifest) Validate() error {
 	var errs []error
 	lower := make(map[string]string, len(m.Files))
 	for _, f := range m.Files {
+		if !isSHA256(f.SHA256) {
+			errs = append(errs, fmt.Errorf("manifest: %s: sha256 %q is not 64 lowercase hex digits", f.Path, f.SHA256))
+		}
+		if f.Size < 0 {
+			errs = append(errs, fmt.Errorf("manifest: %s: negative size %d", f.Path, f.Size))
+		}
+		if _, err := f.FileMode(); err != nil {
+			errs = append(errs, err)
+		}
 		if err := validatePath(f.Path); err != nil {
 			errs = append(errs, err)
 			continue
@@ -32,6 +41,19 @@ func (m *Manifest) Validate() error {
 		}
 	}
 	return errors.Join(errs...)
+}
+
+// isSHA256 reports whether s is a lowercase hex SHA256 digest.
+func isSHA256(s string) bool {
+	if len(s) != 64 {
+		return false
+	}
+	for _, c := range s {
+		if (c < '0' || c > '9') && (c < 'a' || c > 'f') {
+			return false
+		}
+	}
+	return true
 }
 
 // validatePath enforces the path rules on a single manifest path.

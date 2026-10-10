@@ -12,6 +12,7 @@ import (
 // localFile is what the live tree knows about one regular file.
 type localFile struct {
 	hash string // lowercase hex SHA256 of the content
+	size int64
 	mode fs.FileMode
 }
 
@@ -44,7 +45,7 @@ func hashTree(root string) (map[string]localFile, error) {
 		if err != nil {
 			return err
 		}
-		files[filepath.ToSlash(rel)] = localFile{hash: hash, mode: info.Mode().Perm()}
+		files[filepath.ToSlash(rel)] = localFile{hash: hash, size: info.Size(), mode: info.Mode().Perm()}
 		return nil
 	})
 	if err != nil {

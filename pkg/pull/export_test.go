@@ -16,3 +16,11 @@ func SetLinkFn(fn func(oldname, newname string) error) (restore func()) {
 	linkFn = fn
 	return func() { linkFn = orig }
 }
+
+// SetRenameFn swaps the rename used by the swap and returns a restore func —
+// lets black-box tests interrupt a replacement between its renames.
+func SetRenameFn(fn func(oldpath, newpath string) error) (restore func()) {
+	orig := renameFn
+	renameFn = fn
+	return func() { renameFn = orig }
+}

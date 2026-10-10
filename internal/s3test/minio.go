@@ -24,13 +24,14 @@ const (
 // StartMinIO execs a `rustfs server` (an S3-compatible server that replaced
 // MinIO here; the name is kept for its callers) on an ephemeral port backed by
 // a test temp dir and returns an S3 client pointed at it (path-style, static
-// test credentials). The server is killed on test cleanup. Skips the test with
-// a clear message if the rustfs binary is not on PATH.
+// test credentials). The server is killed on test cleanup. A missing rustfs
+// binary fails the test rather than skipping it, so integration runs cannot
+// pass vacuously.
 func StartMinIO(t *testing.T) *s3.Client {
 	t.Helper()
 	bin, err := exec.LookPath("rustfs")
 	if err != nil {
-		t.Skip("rustfs binary not on PATH (provided by devenv); skipping integration test")
+		t.Fatalf("rustfs binary not on PATH (provided by devenv): %v", err)
 	}
 	addr := freeAddr(t)
 	cmd := exec.Command(bin, "server",

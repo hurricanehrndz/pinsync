@@ -1,7 +1,8 @@
 // Package manifest defines the pinsync manifest schema (version 1): a
 // deterministic JSON listing of every regular file under a sync root, each
 // with its SHA256, size, and POSIX permission bits. The manifest is the only
-// source of truth for push and pull decisions.
+// source of truth for push and pull decisions; VerifyTree checks a local tree
+// against one offline.
 package manifest
 
 import (

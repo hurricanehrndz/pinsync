@@ -1,0 +1,274 @@
+name: Release
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+env:
+  EMBALA_VERSION: 0.3.0
+  APPLE_CODESIGN_VERSION: 0.29.0
+jobs:
+  meta:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v5
+      - id: version
+        name: Resolve and check the version
+        shell: bash
+        run: |
+          version=$(awk -F'"' '/^const version = / { print $2 }' cmd/pinsync/main.go)
+          config_version=$(awk -F'"' '/^version = / { print $2; exit }' embala.toml)
+          bump_version=$(awk -F'"' '/^version: / { print $2; exit }' versionbump.yaml)
+
+          if [ -z "$version" ] || [ "$version" != "$config_version" ] || [ "$version" != "$bump_version" ]; then
+            echo "::error::version mismatch: binary=$version embala=$config_version versionbump=$bump_version"
+            exit 1
+          fi
+          if [ "$GITHUB_REF_TYPE" = tag ] && [ "$GITHUB_REF_NAME" != "v$version" ]; then
+            echo "::error::tag $GITHUB_REF_NAME does not match version v$version"
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+      - uses: cachix/install-nix-action@v31
+      # Same rustfs as ci.yml and the devshell: the nixpkgs rev in devenv.lock.
+      - name: Install RustFS from the devenv.lock nixpkgs pin
+        run: |
+          rev=$(jq -er .nodes.nixpkgs.locked.rev devenv.lock)
+          out=$(nix build --no-link --print-out-paths "github:NixOS/nixpkgs/$rev#rustfs")
+          "$out/bin/rustfs" --version | head -1
+          echo "$out/bin" >> "$GITHUB_PATH"
+      - run: go vet ./...
+      - run: go test -tags integration ./...
+  linux:
+    needs: [meta, verify]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+      - name: Build static binary
+        env:
+          VERSION: ${{ needs.meta.outputs.version }}
+        run: |
+          package="pinsync-$VERSION-linux-x86_64"
+          mkdir -p "staging/$package"
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
+            go build -trimpath -ldflags="-s -w" -o "staging/$package/pinsync" ./cmd/pinsync
+          cp README.md "staging/$package/"
+          file "staging/$package/pinsync" | tee /dev/stderr | grep -q "statically linked"
+          tar -czf "$package.tar.gz" -C staging "$package"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: linux-release
+          path: pinsync-*-linux-x86_64.tar.gz
+          if-no-files-found: error
+  windows:
+    needs: [meta, verify]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+      - name: Build payload
+        run: |
+          mkdir -p staging
+          CGO_ENABLED=0 GOOS=windows GOARCH=amd64 \
+            go build -trimpath -ldflags="-s -w" -o staging/pinsync-windows-x86_64.exe ./cmd/pinsync
+          file staging/pinsync-windows-x86_64.exe | tee /dev/stderr | grep -q "PE32+ executable.*x86-64"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: windows-payload
+          path: staging/pinsync-windows-x86_64.exe
+          if-no-files-found: error
+  macos:
+    needs: [meta, verify]
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+      - name: Build universal payload
+        run: |
+          mkdir -p staging
+          CGO_ENABLED=1 GOOS=darwin GOARCH=arm64 \
+            go build -trimpath -ldflags="-s -w" -o staging/pinsync-darwin-arm64 ./cmd/pinsync
+          CGO_ENABLED=1 GOOS=darwin GOARCH=amd64 \
+            go build -trimpath -ldflags="-s -w" -o staging/pinsync-darwin-amd64 ./cmd/pinsync
+          lipo -create \
+            staging/pinsync-darwin-arm64 \
+            staging/pinsync-darwin-amd64 \
+            -output staging/pinsync-darwin-universal
+          lipo staging/pinsync-darwin-universal -verify_arch arm64 x86_64
+      - uses: actions/upload-artifact@v7
+        with:
+          name: macos-payload
+          path: staging/pinsync-darwin-universal
+          if-no-files-found: error
+  installers:
+    needs: [meta, windows, macos]
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/download-artifact@v8
+        with:
+          name: windows-payload
+          path: dist
+      - uses: actions/download-artifact@v8
+        with:
+          name: macos-payload
+          path: dist
+      - name: Install pinned packaging tools
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          mkdir -p "$RUNNER_TEMP/downloads" "$RUNNER_TEMP/bin"
+
+          embala_asset="embala-$EMBALA_VERSION-aarch64-apple-darwin.tar.gz"
+          gh release download "v$EMBALA_VERSION" \
+            --repo hurricanehrndz/embala \
+            --pattern "$embala_asset" \
+            --pattern SHA256SUMS \
+            --dir "$RUNNER_TEMP/downloads"
+          embala_sum=$(awk -v asset="$embala_asset" '$2 == asset { print $1 }' "$RUNNER_TEMP/downloads/SHA256SUMS")
+          test -n "$embala_sum"
+          test "$(shasum -a 256 "$RUNNER_TEMP/downloads/$embala_asset" | awk '{ print $1 }')" = "$embala_sum"
+          tar -xzf "$RUNNER_TEMP/downloads/$embala_asset" \
+            -C "$RUNNER_TEMP/bin" --strip-components=1
+
+          codesign_asset="apple-codesign-$APPLE_CODESIGN_VERSION-macos-universal.tar.gz"
+          gh release download "apple-codesign/$APPLE_CODESIGN_VERSION" \
+            --repo indygreg/apple-platform-rs \
+            --pattern "$codesign_asset" \
+            --pattern "$codesign_asset.sha256" \
+            --dir "$RUNNER_TEMP/downloads"
+          codesign_sum=$(tr -d '[:space:]' < "$RUNNER_TEMP/downloads/$codesign_asset.sha256")
+          test "$(shasum -a 256 "$RUNNER_TEMP/downloads/$codesign_asset" | awk '{ print $1 }')" = "$codesign_sum"
+          tar -xzf "$RUNNER_TEMP/downloads/$codesign_asset" \
+            -C "$RUNNER_TEMP/bin" --strip-components=1
+
+          echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
+      - name: Write signing credentials
+        env:
+          APPLICATION_P12_BASE64: ${{ secrets.MACOS_APPLICATION_CERTIFICATE_P12 }}
+          APPLICATION_P12_PASSWORD: ${{ secrets.MACOS_APPLICATION_CERTIFICATE_PASSWORD }}
+          INSTALLER_P12_BASE64: ${{ secrets.MACOS_INSTALLER_CERTIFICATE_P12 }}
+          INSTALLER_P12_PASSWORD: ${{ secrets.MACOS_INSTALLER_CERTIFICATE_PASSWORD }}
+          NOTARY_API_KEY_JSON: ${{ secrets.MACOS_NOTARY_API_KEY_JSON }}
+        shell: bash
+        run: |
+          : "${APPLICATION_P12_BASE64:?MACOS_APPLICATION_CERTIFICATE_P12 is required}"
+          : "${APPLICATION_P12_PASSWORD:?MACOS_APPLICATION_CERTIFICATE_PASSWORD is required}"
+          : "${INSTALLER_P12_BASE64:?MACOS_INSTALLER_CERTIFICATE_P12 is required}"
+          : "${INSTALLER_P12_PASSWORD:?MACOS_INSTALLER_CERTIFICATE_PASSWORD is required}"
+          : "${NOTARY_API_KEY_JSON:?MACOS_NOTARY_API_KEY_JSON is required}"
+
+          mkdir -p "$RUNNER_TEMP/signing"
+          python3 - <<'PY'
+          import base64
+          import json
+          import os
+          from pathlib import Path
+
+          signing = Path(os.environ["RUNNER_TEMP"]) / "signing"
+          signing.joinpath("application.p12").write_bytes(
+              base64.b64decode(os.environ["APPLICATION_P12_BASE64"], validate=True)
+          )
+          signing.joinpath("installer.p12").write_bytes(
+              base64.b64decode(os.environ["INSTALLER_P12_BASE64"], validate=True)
+          )
+          # Output of `rcodesign encode-app-store-connect-api-key`; parse it so a
+          # malformed secret fails here, not after the upload.
+          key = json.loads(os.environ["NOTARY_API_KEY_JSON"])
+          signing.joinpath("notary-api-key.json").write_text(json.dumps(key))
+          PY
+          printf '%s' "$APPLICATION_P12_PASSWORD" > "$RUNNER_TEMP/signing/application-password"
+          printf '%s' "$INSTALLER_P12_PASSWORD" > "$RUNNER_TEMP/signing/installer-password"
+          chmod 600 "$RUNNER_TEMP/signing/"*
+
+          {
+            echo "MACOS_APPLICATION_P12=$RUNNER_TEMP/signing/application.p12"
+            echo "MACOS_APPLICATION_P12_PASSWORD_FILE=$RUNNER_TEMP/signing/application-password"
+            echo "MACOS_INSTALLER_P12=$RUNNER_TEMP/signing/installer.p12"
+            echo "MACOS_INSTALLER_P12_PASSWORD_FILE=$RUNNER_TEMP/signing/installer-password"
+            echo "MACOS_NOTARY_API_KEY_FILE=$RUNNER_TEMP/signing/notary-api-key.json"
+          } >> "$GITHUB_ENV"
+      - name: Sign the macOS payload
+        run: |
+          chmod +x dist/pinsync-darwin-universal
+          rcodesign sign \
+            --p12-file "$MACOS_APPLICATION_P12" \
+            --p12-password-file "$MACOS_APPLICATION_P12_PASSWORD_FILE" \
+            --code-signature-flags runtime \
+            dist/pinsync-darwin-universal
+          codesign --verify --strict --verbose=2 dist/pinsync-darwin-universal
+      - name: Build installers with embala
+        env:
+          VERSION: ${{ needs.meta.outputs.version }}
+        run: |
+          embala build --config embala.toml --formats msi,pkg --out-dir release
+          mv "release/pinsync-$VERSION.pkg" "release/pinsync-$VERSION-universal.pkg"
+          pkgutil --check-signature "release/pinsync-$VERSION-universal.pkg"
+      - name: Notarize and staple the macOS package
+        env:
+          VERSION: ${{ needs.meta.outputs.version }}
+        run: |
+          pkg="release/pinsync-$VERSION-universal.pkg"
+          rcodesign notary-submit \
+            --api-key-file "$MACOS_NOTARY_API_KEY_FILE" \
+            --max-wait-seconds 1800 \
+            --staple \
+            "$pkg"
+          xcrun stapler validate "$pkg"
+          spctl --assess --type install -vv "$pkg"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: installers
+          path: |
+            release/*.msi
+            release/*.pkg
+          if-no-files-found: error
+  release:
+    needs: [meta, linux, installers]
+    if: github.ref_type == 'tag'
+    permissions:
+      contents: write
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: linux-release
+          path: dist
+      - uses: actions/download-artifact@v8
+        with:
+          name: installers
+          path: dist
+      - name: Checksums
+        run: cd dist && sha256sum pinsync-* | tee SHA256SUMS
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.meta.outputs.version }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            --repo "$GITHUB_REPOSITORY" \
+            --verify-tag \
+            --title "pinsync $VERSION" \
+            --generate-notes \
+            dist/*
