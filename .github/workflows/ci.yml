@@ -11,16 +11,18 @@ jobs:
       - uses: actions/setup-go@v6
         with:
           go-version-file: go.mod
-      - name: Install MinIO (integration tests spawn it; no AWS involved)
+      - uses: cachix/install-nix-action@v31
+      # Same rustfs the devshell gets: built from the nixpkgs rev in devenv.lock
+      # and substituted from cache.nixos.org. Integration tests spawn it.
+      - name: Install RustFS from the devenv.lock nixpkgs pin
         run: |
-          mkdir -p "$HOME/.local/bin"
-          curl -sSfL https://dl.min.io/server/minio/release/linux-amd64/archive/minio.RELEASE.2025-09-07T16-13-09Z \
-            -o "$HOME/.local/bin/minio"
-          chmod +x "$HOME/.local/bin/minio"
-          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          rev=$(jq -er .nodes.nixpkgs.locked.rev devenv.lock)
+          out=$(nix build --no-link --print-out-paths "github:NixOS/nixpkgs/$rev#rustfs")
+          "$out/bin/rustfs" --version | head -1
+          echo "$out/bin" >> "$GITHUB_PATH"
       - run: go build ./...
       - run: go vet ./...
-      # -tags integration compiles the whole suite, unit + MinIO-backed
+      # -tags integration compiles the whole suite, unit + RustFS-backed
       - run: go test -tags integration ./...
   lint:
     runs-on: ubuntu-latest

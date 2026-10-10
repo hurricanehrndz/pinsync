@@ -1,5 +1,5 @@
 // Package s3test provides an in-memory fake of the narrow S3 surface pinsync
-// uses, plus (behind -tags integration) a MinIO test harness. It is shared by
+// uses, plus (behind -tags integration) a RustFS test harness. It is shared by
 // the push and pull tests.
 package s3test
 
