@@ -170,16 +170,19 @@ jobs:
           APPLICATION_P12_PASSWORD: ${{ secrets.MACOS_APPLICATION_CERTIFICATE_PASSWORD }}
           INSTALLER_P12_BASE64: ${{ secrets.MACOS_INSTALLER_CERTIFICATE_P12 }}
           INSTALLER_P12_PASSWORD: ${{ secrets.MACOS_INSTALLER_CERTIFICATE_PASSWORD }}
+          NOTARY_API_KEY_JSON: ${{ secrets.MACOS_NOTARY_API_KEY_JSON }}
         shell: bash
         run: |
           : "${APPLICATION_P12_BASE64:?MACOS_APPLICATION_CERTIFICATE_P12 is required}"
           : "${APPLICATION_P12_PASSWORD:?MACOS_APPLICATION_CERTIFICATE_PASSWORD is required}"
           : "${INSTALLER_P12_BASE64:?MACOS_INSTALLER_CERTIFICATE_P12 is required}"
           : "${INSTALLER_P12_PASSWORD:?MACOS_INSTALLER_CERTIFICATE_PASSWORD is required}"
+          : "${NOTARY_API_KEY_JSON:?MACOS_NOTARY_API_KEY_JSON is required}"
 
           mkdir -p "$RUNNER_TEMP/signing"
           python3 - <<'PY'
           import base64
+          import json
           import os
           from pathlib import Path
 
@@ -190,6 +193,10 @@ jobs:
           signing.joinpath("installer.p12").write_bytes(
               base64.b64decode(os.environ["INSTALLER_P12_BASE64"], validate=True)
           )
+          # Output of `rcodesign encode-app-store-connect-api-key`; parse it so a
+          # malformed secret fails here, not after the upload.
+          key = json.loads(os.environ["NOTARY_API_KEY_JSON"])
+          signing.joinpath("notary-api-key.json").write_text(json.dumps(key))
           PY
           printf '%s' "$APPLICATION_P12_PASSWORD" > "$RUNNER_TEMP/signing/application-password"
           printf '%s' "$INSTALLER_P12_PASSWORD" > "$RUNNER_TEMP/signing/installer-password"
@@ -200,6 +207,7 @@ jobs:
             echo "MACOS_APPLICATION_P12_PASSWORD_FILE=$RUNNER_TEMP/signing/application-password"
             echo "MACOS_INSTALLER_P12=$RUNNER_TEMP/signing/installer.p12"
             echo "MACOS_INSTALLER_P12_PASSWORD_FILE=$RUNNER_TEMP/signing/installer-password"
+            echo "MACOS_NOTARY_API_KEY_FILE=$RUNNER_TEMP/signing/notary-api-key.json"
           } >> "$GITHUB_ENV"
       - name: Sign the macOS payload
         run: |
@@ -217,6 +225,18 @@ jobs:
           embala build --config embala.toml --formats msi,pkg --out-dir release
           mv "release/pinsync-$VERSION.pkg" "release/pinsync-$VERSION-universal.pkg"
           pkgutil --check-signature "release/pinsync-$VERSION-universal.pkg"
+      - name: Notarize and staple the macOS package
+        env:
+          VERSION: ${{ needs.meta.outputs.version }}
+        run: |
+          pkg="release/pinsync-$VERSION-universal.pkg"
+          rcodesign notary-submit \
+            --api-key-file "$MACOS_NOTARY_API_KEY_FILE" \
+            --max-wait-seconds 1800 \
+            --staple \
+            "$pkg"
+          xcrun stapler validate "$pkg"
+          spctl --assess --type install -vv "$pkg"
       - uses: actions/upload-artifact@v7
         with:
           name: installers

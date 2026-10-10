@@ -32,14 +32,15 @@ A `v*` tag publishes three artifacts plus `SHA256SUMS`:
 - `pinsync-<version>-x86_64.msi` is an unsigned Windows x86-64 installer. It
   installs under `C:\Program Files\pinsync` and does not add that directory to
   `PATH`.
-- `pinsync-<version>-universal.pkg` is a signed macOS installer containing an
-  Intel and Apple silicon binary. Install it with Installer.app or
-  `sudo installer -pkg <file> -target /`; it writes `/usr/local/bin/pinsync`.
+- `pinsync-<version>-universal.pkg` is a signed, notarized macOS installer
+  containing an Intel and Apple silicon binary. Install it with Installer.app
+  or `sudo installer -pkg <file> -target /`; it writes `/usr/local/bin/pinsync`.
 - `pinsync-<version>-linux-x86_64.tar.gz` contains a static Linux x86-64 binary.
 
 The release workflow builds both installers with
 [embala](https://github.com/hurricanehrndz/embala). The macOS package is signed
-but not notarized.
+with a Developer ID, notarized, and has its notarization ticket stapled, so
+Gatekeeper accepts it offline.
 
 ## Push (POSIX CI only)
 
