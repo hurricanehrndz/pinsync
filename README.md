@@ -48,6 +48,18 @@ Gatekeeper accepts it offline.
 pinsync push -bucket my-bucket -prefix cfg/prod ./config-tree
 ```
 
+Push uploads only files that are new or changed since the remote manifest.
+Before skipping a file, it checks the object's stored SHA256 checksum and size
+with a `HeadObject`, and re-uploads ("repairs") any object that is missing or
+does not match. This fixes a prefix left inconsistent by a push that failed
+before its manifest upload or by an outside change. `-full` re-uploads
+everything without these checks.
+
+Library users: this release adds `HeadObject` to the `push.S3API` interface
+and new fields to `push.Stats` and `push.Plan`. Custom `S3API` implementations
+and unkeyed `Stats`/`Plan` struct literals must be updated (pinsync is pre-1.0,
+so this ships as a minor release).
+
 ## Pull (macOS / Windows devices)
 
 ```sh

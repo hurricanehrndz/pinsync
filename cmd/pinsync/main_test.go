@@ -187,6 +187,12 @@ func TestDryRunReport(t *testing.T) {
 				"dry-run: 2 would upload, 1 unchanged, 1 orphaned of 3 files at s3://b/p",
 		},
 		{
+			"repair",
+			push.Plan{Upload: []string{"a.txt", "b.txt"}, Repair: []string{"b.txt"}, Unchanged: 1, Total: 3},
+			"would upload a.txt\nwould repair b.txt\n" +
+				"dry-run: 2 would upload (1 to repair), 1 unchanged, 0 orphaned of 3 files at s3://b/p",
+		},
+		{
 			"up to date",
 			push.Plan{Unchanged: 3, Total: 3},
 			"up to date: 3 files unchanged at s3://b/p",
@@ -256,6 +262,11 @@ func TestPushSummary(t *testing.T) {
 	}{
 		{"partial", push.Stats{Uploaded: 2, Skipped: 3, Total: 5}, "pushed 2 of 5 files (3 unchanged) to s3://b/p"},
 		{"noop", push.Stats{Uploaded: 0, Skipped: 5, Total: 5}, "up to date: 5 files unchanged at s3://b/p"},
+		{
+			"repaired",
+			push.Stats{Uploaded: 3, Repaired: 1, Skipped: 7, Total: 10},
+			"pushed 3 of 10 files (1 repaired, 7 unchanged) to s3://b/p",
+		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			if got := pushSummary(tc.stats, "b", "p"); got != tc.want {
