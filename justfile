@@ -49,6 +49,7 @@ build-darwin arch='arm64':
     # -ldflags=-w omits DWARF: Go's external link step otherwise shells out to
     # dsymutil to bundle debug info, which does not exist on a linux host.
 
-# bump the version, commit, and tag (patch|minor|major|...)
+# bump the version in the tracked files (patch|minor|major|...)
+# --no-prompt: versionbump's confirmation loops forever when stdin isn't a TTY.
 bump part="patch":
-    go tool versionbump {{part}}
+    go tool versionbump {{part}} --no-prompt
