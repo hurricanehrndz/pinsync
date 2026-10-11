@@ -1,7 +1,7 @@
 [package]
 name = "pinsync"
 display-name = "pinsync"
-version = "0.2.0"
+version = "0.2.1"
 identifier = "com.github.hurricanehrndz.pinsync"
 publisher = "hurricanehrndz"
 description = "S3 syncing CLI with manifest validation"
