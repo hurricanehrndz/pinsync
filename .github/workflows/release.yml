@@ -13,7 +13,7 @@ env:
   APPLE_CODESIGN_VERSION: 0.29.0
 jobs:
   meta:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     outputs:
       version: ${{ steps.version.outputs.version }}
     steps:
@@ -36,7 +36,7 @@ jobs:
           fi
           echo "version=$version" >> "$GITHUB_OUTPUT"
   verify:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     steps:
       - uses: actions/checkout@v5
       - uses: actions/setup-go@v6
@@ -54,7 +54,7 @@ jobs:
       - run: go test -tags integration ./...
   linux:
     needs: [meta, verify]
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     steps:
       - uses: actions/checkout@v5
       - uses: actions/setup-go@v6
@@ -78,7 +78,7 @@ jobs:
           if-no-files-found: error
   windows:
     needs: [meta, verify]
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     steps:
       - uses: actions/checkout@v5
       - uses: actions/setup-go@v6
@@ -249,7 +249,7 @@ jobs:
     if: github.ref_type == 'tag'
     permissions:
       contents: write
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     steps:
       - uses: actions/download-artifact@v8
         with:
