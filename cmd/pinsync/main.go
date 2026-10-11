@@ -11,6 +11,7 @@ import (
 	"log/slog"
 	"os"
 	"regexp"
+	"slices"
 	"strings"
 	"time"
 
@@ -362,10 +363,16 @@ func executePrune(ctx context.Context, c *cli, client *s3.Client, logger *slog.L
 
 // pushSummary renders the one-line differential push result. Uploaded==0 means
 // nothing new reached the bucket, so the tree is reported as up to date.
+// Repaired objects (re-uploaded because they failed verification) are called
+// out when present.
 func pushSummary(s push.Stats, bucket, prefix string) string {
 	dest := fmt.Sprintf("s3://%s/%s", bucket, prefix)
 	if s.Uploaded == 0 {
 		return fmt.Sprintf("up to date: %d files unchanged at %s", s.Total, dest)
+	}
+	if s.Repaired > 0 {
+		return fmt.Sprintf("pushed %d of %d files (%d repaired, %d unchanged) to %s",
+			s.Uploaded, s.Total, s.Repaired, s.Skipped, dest)
 	}
 	return fmt.Sprintf("pushed %d of %d files (%d unchanged) to %s", s.Uploaded, s.Total, s.Skipped, dest)
 }
@@ -377,7 +384,8 @@ func adoptSummary(s push.Stats, bucket, prefix string) string {
 }
 
 // dryRunReport renders a push dry-run preview: sorted per-file "would upload"
-// and "would orphan" lines followed by a one-line count summary. A tree with no
+// (or "would repair", for an object that failed verification) and "would
+// orphan" lines followed by a one-line count summary. A tree with no
 // pending uploads or orphans reports "up to date"; an adopt preview reports the
 // manifest it would publish with no content uploads.
 func dryRunReport(p push.Plan, bucket, prefix string) string {
@@ -390,13 +398,21 @@ func dryRunReport(p push.Plan, bucket, prefix string) string {
 	}
 	var b strings.Builder
 	for _, path := range p.Upload {
-		fmt.Fprintf(&b, "would upload %s\n", path)
+		verb := "upload"
+		if _, ok := slices.BinarySearch(p.Repair, path); ok {
+			verb = "repair"
+		}
+		fmt.Fprintf(&b, "would %s %s\n", verb, path)
 	}
 	for _, path := range p.Orphan {
 		fmt.Fprintf(&b, "would orphan %s\n", path)
 	}
-	fmt.Fprintf(&b, "dry-run: %d would upload, %d unchanged, %d orphaned of %d files at %s",
-		len(p.Upload), p.Unchanged, len(p.Orphan), p.Total, dest)
+	repaired := ""
+	if len(p.Repair) > 0 {
+		repaired = fmt.Sprintf(" (%d to repair)", len(p.Repair))
+	}
+	fmt.Fprintf(&b, "dry-run: %d would upload%s, %d unchanged, %d orphaned of %d files at %s",
+		len(p.Upload), repaired, p.Unchanged, len(p.Orphan), p.Total, dest)
 	return b.String()
 }
 
