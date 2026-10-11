@@ -34,7 +34,7 @@ run "pinsync push -h", "pinsync pull -h", or "pinsync prune -h" for flags`
 
 // version is the pinsync release version, managed by `go tool versionbump`
 // (see versionbump.yaml).
-const version = "0.2.1"
+const version = "0.2.2"
 
 func main() {
 	err := run(context.Background(), os.Args[1:], os.Stdout, os.Stderr)
