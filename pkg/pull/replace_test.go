@@ -16,8 +16,8 @@ import (
 
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 
-	"github.com/hurricanehrndz/pinsync/internal/s3test"
 	"github.com/hurricanehrndz/pinsync/pkg/pull"
+	"github.com/hurricanehrndz/pinsync/pkg/s3test"
 )
 
 // countingClient wraps an S3API and counts the body bytes pull actually

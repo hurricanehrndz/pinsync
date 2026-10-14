@@ -11,9 +11,9 @@ import (
 
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 
-	"github.com/hurricanehrndz/pinsync/internal/s3test"
 	"github.com/hurricanehrndz/pinsync/pkg/manifest"
 	"github.com/hurricanehrndz/pinsync/pkg/prune"
+	"github.com/hurricanehrndz/pinsync/pkg/s3test"
 )
 
 // manifestBody encodes a schema-v1 manifest naming the given relative paths.

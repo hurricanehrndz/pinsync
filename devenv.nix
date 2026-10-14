@@ -24,7 +24,7 @@ in
     just
     golangci-lint
     zig # C compiler (clang-based) for the darwin cgo cross-build
-    rustfs # spawned by `go test -tags integration` (internal/s3test)
+    rustfs # spawned by `go test -tags integration` (pkg/s3test)
   ];
 
   treefmt = {

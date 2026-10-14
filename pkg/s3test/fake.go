@@ -1,6 +1,7 @@
 // Package s3test provides an in-memory fake of the narrow S3 surface pinsync
-// uses, plus (behind -tags integration) a RustFS test harness. It is shared by
-// the push and pull tests.
+// uses, plus a RustFS test harness (StartRustFS, CreateBucket) that only
+// builds under -tags integration. It is public so other modules can reuse
+// both in their tests.
 package s3test
 
 import (

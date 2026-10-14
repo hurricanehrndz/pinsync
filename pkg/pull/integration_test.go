@@ -15,15 +15,15 @@ import (
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 
-	"github.com/hurricanehrndz/pinsync/internal/s3test"
 	"github.com/hurricanehrndz/pinsync/pkg/pull"
 	"github.com/hurricanehrndz/pinsync/pkg/push"
+	"github.com/hurricanehrndz/pinsync/pkg/s3test"
 )
 
-// TestPullMinIO exercises the full loop against a real S3 implementation:
+// TestPullRustFS exercises the full loop against a real S3 implementation:
 // push → pull → corrupt/delete/add-extraneous → pull → exact convergence.
-func TestPullMinIO(t *testing.T) {
-	client := s3test.StartMinIO(t)
+func TestPullRustFS(t *testing.T) {
+	client := s3test.StartRustFS(t)
 	bucket := s3test.CreateBucket(t, client, "pinsync-pull")
 	ctx := context.Background()
 
@@ -92,12 +92,12 @@ func (c *raceClient) GetObject(ctx context.Context, in *s3.GetObjectInput, opts 
 	return c.Client.GetObject(ctx, in, opts...)
 }
 
-// TestPullWithManifestMinIO covers the manifest-persistence contract against
+// TestPullWithManifestRustFS covers the manifest-persistence contract against
 // a real S3 implementation: exact bytes, BeforeReplace failure, interrupted
 // swap with offline Recover, unchanged-data reuse, bounded bodies and
 // manifests, and retries returning the installed attempt's bytes.
-func TestPullWithManifestMinIO(t *testing.T) {
-	client := s3test.StartMinIO(t)
+func TestPullWithManifestRustFS(t *testing.T) {
+	client := s3test.StartRustFS(t)
 	bucket := s3test.CreateBucket(t, client, "pinsync-manifest")
 	ctx := context.Background()
 

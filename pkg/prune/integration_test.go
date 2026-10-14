@@ -14,9 +14,9 @@ import (
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 
-	"github.com/hurricanehrndz/pinsync/internal/s3test"
 	"github.com/hurricanehrndz/pinsync/pkg/prune"
 	"github.com/hurricanehrndz/pinsync/pkg/push"
+	"github.com/hurricanehrndz/pinsync/pkg/s3test"
 )
 
 // seed pushes a small tree (referenced content + manifest) and drops a couple
@@ -71,11 +71,11 @@ func listKeys(t *testing.T, client *s3.Client, bucket string) []string {
 	return keys
 }
 
-// TestPruneMinIO exercises prune against a real S3 implementation: orphan
+// TestPruneRustFS exercises prune against a real S3 implementation: orphan
 // objects the manifest doesn't reference are deleted while referenced content
 // and the manifest survive.
-func TestPruneMinIO(t *testing.T) {
-	client := s3test.StartMinIO(t)
+func TestPruneRustFS(t *testing.T) {
+	client := s3test.StartRustFS(t)
 	bucket := s3test.CreateBucket(t, client, "pinsync-prune")
 
 	keep := seed(t, client, bucket, "cfg/prod/orphan1.txt", "cfg/prod/sub/orphan2.txt")
@@ -97,7 +97,7 @@ func TestPruneMinIO(t *testing.T) {
 // TestPruneMinAgeProtects verifies the grace window end-to-end: a fresh orphan
 // survives a min-age larger than its real S3 LastModified age.
 func TestPruneMinAgeProtects(t *testing.T) {
-	client := s3test.StartMinIO(t)
+	client := s3test.StartRustFS(t)
 	bucket := s3test.CreateBucket(t, client, "pinsync-prune-minage")
 
 	keep := seed(t, client, bucket, "cfg/prod/orphan.txt")
