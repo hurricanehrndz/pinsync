@@ -17,17 +17,16 @@ import (
 )
 
 const (
-	minioUser     = "pinsync"
-	minioPassword = "pinsync-secret"
+	rustfsUser     = "pinsync"
+	rustfsPassword = "pinsync-secret"
 )
 
-// StartMinIO execs a `rustfs server` (an S3-compatible server that replaced
-// MinIO here; the name is kept for its callers) on an ephemeral port backed by
-// a test temp dir and returns an S3 client pointed at it (path-style, static
+// StartRustFS execs a `rustfs server` on an ephemeral port backed by a test
+// temp dir and returns an S3 client pointed at it (path-style, static
 // test credentials). The server is killed on test cleanup. A missing rustfs
 // binary fails the test rather than skipping it, so integration runs cannot
 // pass vacuously.
-func StartMinIO(t *testing.T) *s3.Client {
+func StartRustFS(t *testing.T) *s3.Client {
 	t.Helper()
 	bin, err := exec.LookPath("rustfs")
 	if err != nil {
@@ -36,8 +35,8 @@ func StartMinIO(t *testing.T) *s3.Client {
 	addr := freeAddr(t)
 	cmd := exec.Command(bin, "server",
 		"--address", addr,
-		"--access-key", minioUser,
-		"--secret-key", minioPassword,
+		"--access-key", rustfsUser,
+		"--secret-key", rustfsPassword,
 		t.TempDir(),
 	)
 	if err := cmd.Start(); err != nil {
@@ -51,7 +50,7 @@ func StartMinIO(t *testing.T) *s3.Client {
 
 	return s3.New(s3.Options{
 		Region:       "us-east-1",
-		Credentials:  credentials.NewStaticCredentialsProvider(minioUser, minioPassword, ""),
+		Credentials:  credentials.NewStaticCredentialsProvider(rustfsUser, rustfsPassword, ""),
 		BaseEndpoint: aws.String("http://" + addr),
 		UsePathStyle: true,
 	})

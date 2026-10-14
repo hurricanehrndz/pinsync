@@ -22,9 +22,9 @@ import (
 	"github.com/aws/smithy-go"
 	smithyhttp "github.com/aws/smithy-go/transport/http"
 
-	"github.com/hurricanehrndz/pinsync/internal/s3test"
 	"github.com/hurricanehrndz/pinsync/pkg/manifest"
 	"github.com/hurricanehrndz/pinsync/pkg/push"
+	"github.com/hurricanehrndz/pinsync/pkg/s3test"
 )
 
 func writeFile(t *testing.T, root, rel, content string) {

@@ -18,10 +18,10 @@ import (
 
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 
-	"github.com/hurricanehrndz/pinsync/internal/s3test"
 	"github.com/hurricanehrndz/pinsync/pkg/manifest"
 	"github.com/hurricanehrndz/pinsync/pkg/pull"
 	"github.com/hurricanehrndz/pinsync/pkg/push"
+	"github.com/hurricanehrndz/pinsync/pkg/s3test"
 )
 
 const prefix = "cfg/prod"

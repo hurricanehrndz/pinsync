@@ -5,7 +5,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/hurricanehrndz/pinsync/internal/s3test"
+	"github.com/hurricanehrndz/pinsync/pkg/s3test"
 )
 
 func TestPushRefusesWindows(t *testing.T) {

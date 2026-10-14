@@ -17,13 +17,13 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 
-	"github.com/hurricanehrndz/pinsync/internal/s3test"
 	"github.com/hurricanehrndz/pinsync/pkg/manifest"
 	"github.com/hurricanehrndz/pinsync/pkg/push"
+	"github.com/hurricanehrndz/pinsync/pkg/s3test"
 )
 
-func TestPushMinIO(t *testing.T) {
-	client := s3test.StartMinIO(t)
+func TestPushRustFS(t *testing.T) {
+	client := s3test.StartRustFS(t)
 	bucket := s3test.CreateBucket(t, client, "pinsync-push")
 	ctx := context.Background()
 
@@ -96,13 +96,13 @@ func (c *manifestFailClient) PutObject(ctx context.Context, in *s3.PutObjectInpu
 	return c.Client.PutObject(ctx, in, opts...)
 }
 
-// TestPushRepairsAfterFailedManifestPutMinIO replays the partial-failure
+// TestPushRepairsAfterFailedManifestPutRustFS replays the partial-failure
 // sequence against real RustFS: push A, push B with the manifest put failing
 // (B lands under A's manifest), push A again. The third push must re-upload f,
 // relying on the server's stored SHA256 checksum, and leave the identical
 // manifest alone.
-func TestPushRepairsAfterFailedManifestPutMinIO(t *testing.T) {
-	server := s3test.StartMinIO(t)
+func TestPushRepairsAfterFailedManifestPutRustFS(t *testing.T) {
+	server := s3test.StartRustFS(t)
 	bucket := s3test.CreateBucket(t, server, "pinsync-repair")
 	client := &manifestFailClient{Client: server, manifestKey: "cfg/prod/manifest.json"}
 	ctx := context.Background()
