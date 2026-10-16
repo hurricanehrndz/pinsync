@@ -40,6 +40,20 @@ const minResumeSize = 1 << 20
 // object; the caller discards it and downloads the whole object instead.
 var errDiscardPrefix = errors.New("kept prefix does not continue the object")
 
+// errPrefixStuck marks a prefix file that cannot be created, renamed or
+// removed (an open handle on Windows, an ACL). The caller downloads the
+// object without resuming instead, so the stuck file costs its resume, not
+// the pull, however many pulls it outlives (but see clearResumeDir).
+var errPrefixStuck = errors.New("cannot use the kept partial download")
+
+// stuck wraps a failure of the prefix files in errPrefixStuck.
+func stuck(err error) error {
+	if err == nil {
+		return nil
+	}
+	return fmt.Errorf("%w: %w", errPrefixStuck, err)
+}
+
 // prefixInfo is a kept prefix's sidecar: the manifest content its bytes are
 // the start of, and the object they came from. Its length is the data file's
 // own; every byte is re-hashed before anything trusts it.
@@ -98,7 +112,7 @@ func (s *syncer) adoptPrefixes(jobs []job) {
 			}
 			err := os.MkdirAll(filepath.Dir(mv[1]), 0o755)
 			if err == nil {
-				err = os.Rename(mv[0], mv[1])
+				err = renameFn(mv[0], mv[1])
 			}
 			if err != nil {
 				s.logger.Debug("could not keep a partial download", "path", j.f.Path, "error", err)
@@ -138,7 +152,7 @@ func (p prefixFiles) inspect(f manifest.File) (int64, prefixInfo, bool) {
 // copying forward leaves p.prev whole and p.data incomplete.
 func (p prefixFiles) load(f manifest.File) (int64, prefixInfo, bool) {
 	if exists(p.prev) {
-		if err := os.Rename(p.prev, p.data); err != nil {
+		if err := renameFn(p.prev, p.data); err != nil {
 			return 0, prefixInfo{}, false
 		}
 	}
@@ -148,7 +162,7 @@ func (p prefixFiles) load(f manifest.File) (int64, prefixInfo, bool) {
 // discard removes every prefix file, so a fresh download starts from none.
 func (p prefixFiles) discard() error {
 	for _, name := range []string{p.data, p.prev, p.info, p.info + ".tmp"} {
-		if err := os.Remove(name); err != nil && !errors.Is(err, fs.ErrNotExist) {
+		if err := removeFn(name); err != nil && !errors.Is(err, fs.ErrNotExist) {
 			return err
 		}
 	}
@@ -163,7 +177,7 @@ func (p prefixFiles) writeInfo(info prefixInfo) error {
 		return err
 	}
 	tmp := p.info + ".tmp"
-	if err = os.Remove(tmp); err != nil && !errors.Is(err, fs.ErrNotExist) {
+	if err = removeFn(tmp); err != nil && !errors.Is(err, fs.ErrNotExist) {
 		return err
 	}
 	fh, err := os.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o644)
@@ -177,18 +191,19 @@ func (p prefixFiles) writeInfo(info prefixInfo) error {
 	if err != nil {
 		return err
 	}
-	return os.Rename(tmp, p.info)
+	return renameFn(tmp, p.info)
 }
 
 // install moves the verified data to its staged path dst, drops the sidecar
-// and applies the entry's mode.
+// and applies the entry's mode. A sidecar that cannot be removed is left: it
+// is never trusted without its data, and stage clears the resume directory
+// (see clearResumeDir). Only a failed chmod, as for any staged file, is an
+// error once dst exists.
 func (p prefixFiles) install(dst string, mode fs.FileMode) error {
-	if err := os.Rename(p.data, dst); err != nil {
-		return err
+	if err := renameFn(p.data, dst); err != nil {
+		return stuck(err)
 	}
-	if err := os.Remove(p.info); err != nil {
-		return err
-	}
+	_ = removeFn(p.info)
 	return chmod(dst, mode)
 }
 
@@ -218,13 +233,26 @@ func rangeRefused(err error) bool {
 // which a failure leaves for the next pull (see keepStaged). A kept prefix is
 // continued with a ranged GET; when it cannot be shown to belong to the
 // object, or the result fails the hash, it is discarded and the whole object
-// downloaded in the same call. It reports whether f was completed from a
-// prefix.
+// downloaded in the same call. When the prefix files themselves cannot be
+// created, renamed or removed, the object is downloaded whole straight to
+// dst, as one below minResumeSize is. It reports whether f was completed
+// from a prefix.
 func (s *syncer) downloadResumable(ctx context.Context, f manifest.File, dst string, mode fs.FileMode) (bool, error) {
+	resumed, err := s.resumeOrFetch(ctx, f, dst, mode)
+	if !errors.Is(err, errPrefixStuck) {
+		return resumed, err
+	}
+	s.logger.Warn("cannot keep a partial download; downloading it without resuming", "path", f.Path, "error", err)
+	return false, s.downloadWhole(ctx, f, dst, mode)
+}
+
+// resumeOrFetch is downloadResumable through the prefix files. An error
+// wrapping errPrefixStuck leaves dst absent.
+func (s *syncer) resumeOrFetch(ctx context.Context, f manifest.File, dst string, mode fs.FileMode) (bool, error) {
 	key := path.Join(s.prefix, f.Path)
 	p := prefixFilesIn(s.tmp, f.SHA256)
 	if err := os.MkdirAll(filepath.Dir(p.data), 0o755); err != nil {
-		return false, err
+		return false, stuck(err)
 	}
 	var whole *s3.GetObjectOutput
 	if n, info, ok := p.load(f); ok {
@@ -246,7 +274,7 @@ func (s *syncer) downloadResumable(ctx context.Context, f manifest.File, dst str
 		if whole != nil {
 			_ = whole.Body.Close()
 		}
-		return false, err
+		return false, stuck(err)
 	}
 	return false, s.fetchWhole(ctx, key, f, p, whole, dst, mode)
 }
@@ -256,8 +284,9 @@ func (s *syncer) downloadResumable(ctx context.Context, f manifest.File, dst str
 // extend. It returns nil when f is staged from the prefix; the server's
 // output when it ignored the Range and sent the whole object; an error
 // wrapping errDiscardPrefix when the prefix cannot be shown to continue the
-// object or the result fails the hash; and any other error (the pull fails,
-// the prefix is kept) as is.
+// object or the result fails the hash; one wrapping errPrefixStuck when the
+// prefix files cannot be used; and any other error (the pull fails, the
+// prefix is kept) as is.
 func (s *syncer) continuePrefix(ctx context.Context, key string, f manifest.File, p prefixFiles, n int64,
 	info prefixInfo, dst string, mode fs.FileMode,
 ) (*s3.GetObjectOutput, error) {
@@ -315,22 +344,29 @@ func checkContinues(out *s3.GetObjectOutput, f manifest.File, n int64, info pref
 // which another name may share: the prefix moves to p.prev and is copied
 // forward into a new p.data, so a kill at any point leaves either p.prev
 // (which load prefers) or a p.data that is again a prefix. The prefix is
-// hashed together with rest; a mismatch wraps errDiscardPrefix.
+// hashed together with rest; a mismatch wraps errDiscardPrefix, and a
+// prefix file that cannot be renamed, created, read or removed wraps
+// errPrefixStuck.
 // CEILING: the copy rewrites up to one object's bytes locally per resume;
 // far cheaper than the network, and the read is needed for the hash anyway.
+// While it runs, p.prev and p.data together take up to twice the prefix on
+// disk, which MaxContentBytes does not count; one object at most.
 func (p prefixFiles) extend(f manifest.File, n int64, rest io.Reader, dst string, mode fs.FileMode) error {
-	if err := os.Rename(p.data, p.prev); err != nil {
-		return err
+	if err := renameFn(p.data, p.prev); err != nil {
+		return stuck(err)
 	}
 	fh, err := createData(p.data, mode)
 	if err != nil {
-		return err
+		return stuck(err)
 	}
 	h := sha256.New()
 	err = copyPrefix(fh, p.prev, n, h)
 	if err == nil {
 		// From here a cut-off leaves p.data as the one, longer, prefix.
-		err = os.Remove(p.prev)
+		err = removeFn(p.prev)
+	}
+	if err != nil && !errors.Is(err, errDiscardPrefix) {
+		err = stuck(err)
 	}
 	var got int64
 	if err == nil {
@@ -367,7 +403,8 @@ func copyPrefix(fh io.Writer, src string, n int64, h hash.Hash) error {
 // already sent it, recording the object's ETag in the sidecar first so a
 // cut-off leaves a prefix the next pull can continue. Without an ETag there
 // is nothing to make that GET conditional on, so it is written like a small
-// download. A mismatch is a staged mismatch, as for any whole download.
+// download. A mismatch is a staged mismatch, as for any whole download;
+// prefix files that cannot be written wrap errPrefixStuck.
 func (s *syncer) fetchWhole(ctx context.Context, key string, f manifest.File, p prefixFiles,
 	whole *s3.GetObjectOutput, dst string, mode fs.FileMode,
 ) error {
@@ -393,11 +430,11 @@ func (s *syncer) fetchWhole(ctx context.Context, key string, f manifest.File, p 
 		SHA256: f.SHA256, Size: f.Size, ETag: aws.ToString(out.ETag), VersionID: aws.ToString(out.VersionId),
 	})
 	if err != nil {
-		return err
+		return stuck(err)
 	}
 	fh, err := createData(p.data, mode)
 	if err != nil {
-		return err
+		return stuck(err)
 	}
 	h := sha256.New()
 	n, err := io.Copy(fh, io.TeeReader(io.LimitReader(out.Body, f.Size+1), h))

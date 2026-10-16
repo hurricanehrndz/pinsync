@@ -133,3 +133,27 @@ func TestSetETag(t *testing.T) {
 		t.Errorf("ETag after Store = %s, want the content ETag %s", aws.ToString(after.ETag), aws.ToString(before.ETag))
 	}
 }
+
+// TestSetVersionID: GETs report no VersionId unless SetVersionID set one, as
+// an unversioned bucket does, and a later Store resets it.
+func TestSetVersionID(t *testing.T) {
+	f := NewFake()
+	f.Store("k", []byte("0123456789"))
+	for _, tc := range []struct {
+		arrange func()
+		want    *string
+	}{
+		{func() {}, nil},
+		{func() { f.SetVersionID("k", "v2") }, aws.String("v2")},
+		{func() { f.Store("k", []byte("0123456789")) }, nil},
+	} {
+		tc.arrange()
+		out, _, err := get(t, f, "k", "bytes=4-", "")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if aws.ToString(out.VersionId) != aws.ToString(tc.want) || (out.VersionId == nil) != (tc.want == nil) {
+			t.Errorf("VersionId = %v, want %v", aws.ToString(out.VersionId), aws.ToString(tc.want))
+		}
+	}
+}

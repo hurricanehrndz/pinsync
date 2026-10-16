@@ -8,10 +8,12 @@ import (
 	"time"
 )
 
-// renameFn and removeAllFn are test seams for interrupting the swap between
-// its renames and for failing the renames and removals of sibling trees.
+// renameFn, removeFn and removeAllFn are test seams for interrupting the
+// swap between its renames and for failing the renames and removals of
+// sibling trees and kept prefixes.
 var (
 	renameFn    = os.Rename
+	removeFn    = os.Remove
 	removeAllFn = os.RemoveAll
 )
 

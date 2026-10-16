@@ -61,9 +61,12 @@ func recoverInterrupted(dest, tmp, old, partial string, logger *slog.Logger) err
 // that directory mid-write; downloadResumable only trusts what it re-hashes.
 // If the partial tree still exists, staging either never got past
 // reusing it (stage removes it before the first download) or could not
-// remove it; tmp is deleted instead, never merged into it, costing at most
-// the downloads since. A tmp that cannot be renamed is deleted too; the error
-// is returned only when it can be neither kept nor deleted.
+// remove it; tmp is deleted instead, costing at most the downloads since.
+// A tmp that cannot be renamed is deleted too; the error is returned only
+// when it can be neither kept nor deleted. Before tmp is deleted, its kept
+// prefixes move into the partial tree (see stashPrefixes): they include the
+// ones stage adopted from it, so while that tree is stuck a slow link would
+// otherwise lose every run's progress on a large object.
 func keepStaged(tmp, partial string, logger *slog.Logger) error {
 	if !exists(tmp) {
 		return nil
@@ -77,10 +80,37 @@ func keepStaged(tmp, partial string, logger *slog.Logger) error {
 		logger.Warn("could not keep staged files for the next pull; discarding them",
 			"from", tmp, "to", partial, "error", err)
 	}
+	stashPrefixes(tmp, partial, logger)
 	if err := removeAllFn(tmp); err != nil {
 		return fmt.Errorf("pull: removing stale %s: %w", tmp, err)
 	}
 	return nil
+}
+
+// stashPrefixes moves the files in tmp's resume directory into partial's,
+// best effort, never replacing one already there. It keeps no state, so
+// recovery after a kill mid-move just runs it again. A sidecar and data file
+// that end up from different attempts are safe: nothing is trusted before
+// the whole object hashes right (see downloadResumable).
+func stashPrefixes(tmp, partial string, logger *slog.Logger) {
+	from, to := filepath.Join(tmp, resumeDir), filepath.Join(partial, resumeDir)
+	entries, err := os.ReadDir(from)
+	if err != nil || len(entries) == 0 {
+		return
+	}
+	if err := os.MkdirAll(to, 0o755); err != nil {
+		logger.Debug("could not keep partial downloads", "path", to, "error", err)
+		return
+	}
+	for _, e := range entries {
+		dst := filepath.Join(to, e.Name())
+		if exists(dst) {
+			continue
+		}
+		if err := renameFn(filepath.Join(from, e.Name()), dst); err != nil {
+			logger.Debug("could not keep a partial download", "path", dst, "error", err)
+		}
+	}
 }
 
 // exists reports whether the path itself exists (without following links).

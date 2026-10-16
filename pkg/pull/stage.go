@@ -106,12 +106,9 @@ func (s *syncer) stage(ctx context.Context, m *manifest.Manifest, live map[strin
 	if err := s.stageAll(ctx, remote, partial, &c); err != nil {
 		return Stats{}, err
 	}
-	// Every resumable download installed its file and dropped its sidecar,
-	// so this removes at most an empty directory, which must go before
-	// VerifyTree.
 	if slices.ContainsFunc(remote, func(j job) bool { return j.resume }) {
-		if err := os.RemoveAll(filepath.Join(s.tmp, resumeDir)); err != nil {
-			return Stats{}, fmt.Errorf("pull: removing the staging tree's resume directory: %w", err)
+		if err := s.clearResumeDir(); err != nil {
+			return Stats{}, err
 		}
 	}
 	return Stats{
@@ -121,6 +118,30 @@ func (s *syncer) stage(ctx context.Context, m *manifest.Manifest, live map[strin
 		Reused:     int(c.reused.Load()),
 		Resumed:    int(c.resumed.Load()),
 	}, nil
+}
+
+// clearResumeDir removes the staging tree's resume directory, which must go
+// before VerifyTree. Every resumable download installed its file and dropped
+// its sidecar, so it holds at most what one that fell back to a plain
+// download could not remove (see downloadResumable). Rather than failing the
+// pull, that is moved aside into the partial tree, for a later pull to adopt
+// or remove. Only a file that can be neither removed nor moved fails the
+// pull; it could not have left the staging tree in the swap either. Moving
+// it aside can create the partial tree, so if this pull then fails anyway,
+// keepStaged deletes the staging tree rather than keeping it: that costs
+// this pull's downloads, and only when a prefix is already stuck.
+func (s *syncer) clearResumeDir() error {
+	dir := filepath.Join(s.tmp, resumeDir)
+	err := removeAllFn(dir)
+	if err == nil {
+		return nil
+	}
+	s.logger.Warn("could not remove leftover partial downloads; moving them aside", "path", dir, "error", err)
+	stashPrefixes(s.tmp, s.partial, s.logger)
+	if err := removeAllFn(dir); err != nil {
+		return fmt.Errorf("pull: removing the staging tree's resume directory: %w", err)
+	}
+	return nil
 }
 
 // stageAll stages jobs on up to s.parallel workers.
@@ -249,20 +270,26 @@ func (s *syncer) download(ctx context.Context, j job, dst string) (bool, error) 
 	if j.resume {
 		return s.downloadResumable(ctx, j.f, dst, j.mode)
 	}
-	key := path.Join(s.prefix, j.f.Path)
+	return false, s.downloadWhole(ctx, j.f, dst, j.mode)
+}
+
+// downloadWhole fetches f with one whole-object GET and writes it to dst
+// with writeVerified, keeping nothing to resume.
+func (s *syncer) downloadWhole(ctx context.Context, f manifest.File, dst string, mode fs.FileMode) error {
+	key := path.Join(s.prefix, f.Path)
 	out, err := s.client.GetObject(ctx, &s3.GetObjectInput{
 		Bucket:       aws.String(s.bucket),
 		Key:          aws.String(key),
 		ChecksumMode: types.ChecksumModeEnabled,
 	})
 	if err != nil {
-		return false, fmt.Errorf("pull: fetching %s: %w", key, err)
+		return fmt.Errorf("pull: fetching %s: %w", key, err)
 	}
 	defer func() { _ = out.Body.Close() }()
-	if err := writeVerified(out.Body, j.f, dst, j.mode); err != nil {
-		return false, fmt.Errorf("pull: downloading %s: %w", key, err)
+	if err := writeVerified(out.Body, f, dst, mode); err != nil {
+		return fmt.Errorf("pull: downloading %s: %w", key, err)
 	}
-	return false, nil
+	return nil
 }
 
 // copyFromSource stages one entry from ReplaceFromDirectory's source tree.

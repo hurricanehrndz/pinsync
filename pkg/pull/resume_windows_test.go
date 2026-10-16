@@ -60,3 +60,26 @@ func TestPullResumeWithPrefixHeldOpen(t *testing.T) {
 	assertNoLeftovers(t, dest)
 	assertNoPartial(t, dest)
 }
+
+// TestPullWithKeptPrefixHeldOpen: a kept prefix that another process holds
+// open without delete sharing during the next pull can be neither adopted
+// nor removed. That pull downloads the object whole instead of failing, and
+// once the handle closes a later pull removes the leftover.
+func TestPullWithKeptPrefixHeldOpen(t *testing.T) {
+	fake := s3test.NewFake()
+	files, dest := resumeFixture(t, fake)
+	cutOffPull(t, fake, dest)
+	release := holdOpen(t, resumeFile(partialDir(dest), files[bigPath], ""))
+
+	stats, rc := resumedPull(t, fake, dest)
+	if g := rc.gets(bigKey); len(g) != 1 || g[0].rng != "" || stats.Resumed != 0 {
+		t.Errorf("GETs = %+v, stats %+v; want one whole-object GET", g, stats)
+	}
+	assertTree(t, dest, files)
+	assertNoLeftovers(t, dest)
+
+	release()
+	mustPull(t, fake, dest)
+	assertTree(t, dest, files)
+	assertNoPartial(t, dest)
+}

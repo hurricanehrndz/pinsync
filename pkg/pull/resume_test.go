@@ -439,10 +439,41 @@ func TestPullResumeFallsBack(t *testing.T) {
 				}
 			}
 		}, 2},
+		{"range past the end (416)", func(t *testing.T, fake *s3test.Fake, _, content string) func(*s3.GetObjectInput, *s3.GetObjectOutput) {
+			// The resume finds the object shorter than the prefix under the
+			// prefix's ETag; by the fallback GET it is whole again.
+			etag, gets := etagOf(t, fake, bigKey), 0
+			fake.BeforeGet = func(f *s3test.Fake, key string) {
+				if key != bigKey {
+					return
+				}
+				if gets++; gets == 1 {
+					f.Store(bigKey, []byte(content[:1000]))
+					f.SetETag(bigKey, etag)
+				} else {
+					f.Store(bigKey, []byte(content))
+				}
+			}
+			return nil
+		}, 2},
+		{"another version under the same ETag", func(_ *testing.T, fake *s3test.Fake, _, _ string) func(*s3.GetObjectInput, *s3.GetObjectOutput) {
+			fake.SetVersionID(bigKey, "v2")
+			return nil
+		}, 2},
+		{"206 body longer than its Content-Range", func(*testing.T, *s3test.Fake, string, string) func(*s3.GetObjectInput, *s3.GetObjectOutput) {
+			return func(in *s3.GetObjectInput, out *s3.GetObjectOutput) {
+				if in.Range != nil {
+					out.Body = io.NopCloser(io.MultiReader(out.Body, strings.NewReader("junk")))
+				}
+			}
+		}, 2},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			fake := s3test.NewFake()
 			files, dest := resumeFixture(t, fake)
+			// The prefix's sidecar records this version; checkContinues
+			// must notice when a resume serves another.
+			fake.SetVersionID(bigKey, "v1")
 			cutOffPull(t, fake, dest)
 			rewrite := tc.arrange(t, fake, dest, files[bigPath])
 
@@ -668,4 +699,224 @@ func TestPullResumeNeverWritesThroughALink(t *testing.T) {
 		t.Errorf("the linked file changed (%d -> %d bytes, err %v)", len(before), len(after), err)
 	}
 	assertTree(t, dest, files)
+}
+
+// TestPullStuckPrefixFallsBack: a prefix file the pull cannot rename,
+// create or remove (an open handle on Windows, an ACL) costs only its
+// resume. The pull downloads the object whole instead of failing; failing
+// would repeat on every pull, since the stuck file is kept with the partial
+// tree and adopted again.
+func TestPullStuckPrefixFallsBack(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		cutOff   bool
+		stale    bool                                     // the object's ETag changed, so the prefix is discarded
+		rename   func(data, staged, from, to string) bool // reports a rename to fail; nil fails none
+		remove   func(data, name string) bool             // reports a remove to fail; nil fails none
+		wantGets []string                                 // ranges of the big object's GETs
+		resumed  int
+	}{
+		{
+			name: "prefix cannot be discarded", cutOff: true, stale: true,
+			remove:   func(data, name string) bool { return name == data },
+			wantGets: []string{"bytes=1048699-", ""},
+		},
+		{
+			name: "prefix cannot be moved aside to copy forward", cutOff: true,
+			rename:   func(data, _, from, to string) bool { return from == data && to == data+".prev" },
+			wantGets: []string{"bytes=1048699-", ""},
+		},
+		{
+			name: "completed prefix cannot be installed", cutOff: true,
+			rename:   func(data, staged, from, to string) bool { return from == data && to == staged },
+			wantGets: []string{"bytes=1048699-", ""},
+		},
+		{
+			name:     "sidecar cannot be written",
+			rename:   func(data, _, from, _ string) bool { return from == data+".json.tmp" },
+			wantGets: []string{"", ""},
+		},
+		{
+			name: "sidecar cannot be removed after install", cutOff: true,
+			remove:   func(data, name string) bool { return name == data+".json" },
+			wantGets: []string{"bytes=1048699-"}, resumed: 1,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			fake := s3test.NewFake()
+			files, dest := resumeFixture(t, fake)
+			if tc.cutOff {
+				cutOffPull(t, fake, dest)
+			}
+			if tc.stale {
+				fake.SetETag(bigKey, `"re-uploaded"`)
+			}
+			tmp := dest + ".pinsync-tmp"
+			data, staged := resumeFile(tmp, files[bigPath], ""), filepath.Join(tmp, filepath.FromSlash(bigPath))
+			stuck := errors.New("held open")
+			defer pull.SetRenameFn(func(from, to string) error {
+				if tc.rename != nil && tc.rename(data, staged, from, to) {
+					return stuck
+				}
+				return os.Rename(from, to)
+			})()
+			defer pull.SetRemoveFn(func(name string) error {
+				if tc.remove != nil && tc.remove(data, name) {
+					return stuck
+				}
+				return os.Remove(name)
+			})()
+
+			stats, rc := resumedPull(t, fake, dest)
+			g := rc.gets(bigKey)
+			var ranges []string
+			for _, call := range g {
+				ranges = append(ranges, call.rng)
+			}
+			if !reflect.DeepEqual(ranges, tc.wantGets) {
+				t.Fatalf("GETs = %+v, want ranges %q", g, tc.wantGets)
+			}
+			if last := g[len(g)-1]; last.rng == "" && last.mode != types.ChecksumModeEnabled {
+				t.Errorf("fallback GET = %+v, want checksum mode", last)
+			}
+			if stats.Resumed != tc.resumed || stats.Downloaded != 2-boolInt(tc.cutOff) || manifestGets(fake) != 1 {
+				t.Errorf("stats = %+v after %d manifest GETs, want Resumed=%d and no re-sync",
+					stats, manifestGets(fake), tc.resumed)
+			}
+			assertTree(t, dest, files)
+			assertNoLeftovers(t, dest)
+			assertNoPartial(t, dest)
+		})
+	}
+}
+
+func boolInt(b bool) int {
+	if b {
+		return 1
+	}
+	return 0
+}
+
+// TestPullStuckPrefixNeverFailsAPull: a prefix file that cannot be removed at
+// all, even with its directory, is moved aside into the partial tree rather
+// than failing the pull or reaching dest; the next pull adopts it again and
+// still succeeds.
+func TestPullStuckPrefixNeverFailsAPull(t *testing.T) {
+	fake := s3test.NewFake()
+	files, dest := resumeFixture(t, fake)
+	cutOffPull(t, fake, dest)
+	fake.SetETag(bigKey, `"re-uploaded"`) // every resume is refused, so the prefix is discarded
+	tmp := dest + ".pinsync-tmp"
+	data := resumeFile(tmp, files[bigPath], "")
+	stuck := errors.New("held open")
+	defer pull.SetRemoveFn(func(name string) error {
+		if name == data {
+			return stuck
+		}
+		return os.Remove(name)
+	})()
+	defer pull.SetRemoveAllFn(func(p string) error {
+		if strings.HasPrefix(data, p+string(filepath.Separator)) && exists(data) {
+			return stuck
+		}
+		return os.RemoveAll(p)
+	})()
+
+	for i := range 2 {
+		stats, rc := resumedPull(t, fake, dest)
+		if g := rc.gets(bigKey); len(g) != 2 || g[1].rng != "" || stats.Resumed != 0 {
+			t.Errorf("pull %d: GETs %+v, stats %+v; want a refused resume, then a whole download", i+1, g, stats)
+		}
+		assertTree(t, dest, files) // and no resume directory in dest
+		assertNoLeftovers(t, dest)
+		if _, err := os.Stat(resumeFile(partialDir(dest), files[bigPath], "")); err != nil {
+			t.Errorf("pull %d: the stuck prefix was not moved aside: %v", i+1, err)
+		}
+		mustRemoveAll(t, dest) // so the next pull downloads it again
+	}
+}
+
+func exists(p string) bool {
+	_, err := os.Lstat(p)
+	return err == nil
+}
+
+func mustRemoveAll(t *testing.T, p string) {
+	t.Helper()
+	if err := os.RemoveAll(p); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestPullResumesPastAStuckPartialTree: while the partial tree cannot be
+// removed, a failed pull deletes its staging tree instead of keeping it, but
+// first moves its prefixes back into the partial tree. A slow link then
+// keeps each run's progress on a large object instead of starting over.
+func TestPullResumesPastAStuckPartialTree(t *testing.T) {
+	const more = 100_000 // bytes the second, also cut-off, pull adds
+	fake := s3test.NewFake()
+	files, dest := resumeFixture(t, fake)
+	first := cutOffPull(t, fake, dest)
+	restore := pull.SetRemoveAllFn(func(p string) error {
+		if p == partialDir(dest) {
+			return errors.New("held open")
+		}
+		return os.RemoveAll(p)
+	})
+	second := &recordingClient{S3API: fake, cutKey: bigKey, cut: more, onCut: func() error { return errReset }}
+	_, err := pull.Pull(context.Background(), second, "bkt", prefix, dest, pull.Options{Parallel: 1})
+	restore()
+	if !errors.Is(err, errReset) {
+		t.Fatalf("second cut-off Pull = %v, want %v", err, errReset)
+	}
+
+	stats, third := resumedPull(t, fake, dest)
+	if g := third.gets(bigKey); len(g) != 1 || g[0].rng != "bytes=1148699-" {
+		t.Errorf("GETs = %+v, want one resuming at %d", g, cutAt+more)
+	}
+	if total := first.bytesRead(bigKey) + second.bytesRead(bigKey) + third.bytesRead(bigKey); total != bigSize {
+		t.Errorf("object bytes fetched over three pulls = %d, want %d", total, bigSize)
+	}
+	if stats.Resumed != 1 {
+		t.Errorf("stats = %+v, want Resumed=1", stats)
+	}
+	assertTree(t, dest, files)
+	assertNoLeftovers(t, dest)
+	assertNoPartial(t, dest)
+}
+
+// TestRecoverKeepsPrefixesBesideAPartialTree: a pull killed while the
+// partial tree still existed leaves both trees; recovery deletes the staging
+// tree but keeps its prefixes, without replacing one the partial tree has.
+func TestRecoverKeepsPrefixesBesideAPartialTree(t *testing.T) {
+	fake := s3test.NewFake()
+	files, dest := resumeFixture(t, fake)
+	cutOffPull(t, fake, dest)
+	tmp := dest + ".pinsync-tmp"
+	if err := os.Rename(partialDir(dest), tmp); err != nil {
+		t.Fatal(err)
+	}
+	// What the partial tree already has wins; a stray sidecar here is
+	// harmless, since nothing is trusted before it hashes right.
+	writeFile(t, partialDir(dest), "a.txt", "alpha", 0o644)
+	other := resumeFile(partialDir(dest), "other", ".json")
+	writeFile(t, filepath.Dir(other), filepath.Base(other), "{}", 0o644)
+	writeFile(t, tmp, ".pinsync-resume/"+filepath.Base(other), "replaced", 0o644)
+
+	if err := pull.Recover(context.Background(), dest, nil); err != nil {
+		t.Fatalf("Recover: %v", err)
+	}
+	if exists(tmp) {
+		t.Error("recovery kept the staging tree beside the partial tree")
+	}
+	if b, err := os.ReadFile(other); err != nil || string(b) != "{}" {
+		t.Errorf("partial tree's own file = %q, %v; want it kept as it was", b, err)
+	}
+
+	stats, rc := resumedPull(t, fake, dest)
+	if g := rc.gets(bigKey); len(g) != 1 || g[0].rng != "bytes=1048699-" || stats.Resumed != 1 {
+		t.Errorf("GETs = %+v, stats %+v; want one resuming at %d", g, stats, cutAt)
+	}
+	assertTree(t, dest, files)
+	assertNoPartial(t, dest)
 }

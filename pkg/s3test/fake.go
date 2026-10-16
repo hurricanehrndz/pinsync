@@ -35,6 +35,7 @@ type Fake struct {
 	mod         map[string]time.Time
 	sums        map[string]string // base64 SHA256, only for SHA256-checksummed puts
 	etags       map[string]string // SetETag overrides; the default is the body's MD5
+	versions    map[string]string // SetVersionID values; the default is none, as in an unversioned bucket
 	putAlgo     map[string]types.ChecksumAlgorithm
 	putSum      map[string]string // ChecksumSHA256 supplied by the caller, "" if none
 	getMode     map[string]types.ChecksumMode
@@ -66,6 +67,7 @@ func NewFake() *Fake {
 		mod:      map[string]time.Time{},
 		sums:     map[string]string{},
 		etags:    map[string]string{},
+		versions: map[string]string{},
 		putAlgo:  map[string]types.ChecksumAlgorithm{},
 		putSum:   map[string]string{},
 		getMode:  map[string]types.ChecksumMode{},
@@ -117,6 +119,7 @@ func (f *Fake) PutObject(ctx context.Context, in *s3.PutObjectInput, _ ...func(*
 	f.mu.Lock()
 	f.objects[key] = body
 	delete(f.etags, key)
+	delete(f.versions, key)
 	f.putAlgo[key] = in.ChecksumAlgorithm
 	f.putSum[key] = aws.ToString(in.ChecksumSHA256)
 	if in.ChecksumAlgorithm == types.ChecksumAlgorithmSha256 {
@@ -196,10 +199,10 @@ func sleep(ctx context.Context, d time.Duration) error {
 }
 
 // GetObject serves the stored body, recording call order and checksum mode.
-// Like S3 it returns an ETag (the body's MD5 unless SetETag overrides it),
-// fails a stale IfMatch with 412 PreconditionFailed, and serves a
-// "bytes=N-" or "bytes=N-M" Range with a Content-Range, or 416 InvalidRange
-// when N is past the end; errors carry the HTTP status as the SDK's do.
+// Like S3 it returns an ETag (the body's MD5 unless SetETag overrides it)
+// and any VersionId set with SetVersionID, fails a stale IfMatch with 412
+// PreconditionFailed, and serves a "bytes=N-" or "bytes=N-M" Range with a
+// Content-Range, or 416 InvalidRange when N is past the end; errors carry the HTTP status as the SDK's do.
 // IgnoreRange serves the whole object instead, as a server without range
 // support does. GetBody transforms the whole body before any range is cut.
 func (f *Fake) GetObject(_ context.Context, in *s3.GetObjectInput, _ ...func(*s3.Options)) (*s3.GetObjectOutput, error) {
@@ -212,6 +215,7 @@ func (f *Fake) GetObject(_ context.Context, in *s3.GetObjectInput, _ ...func(*s3
 	f.getMode[key] = in.ChecksumMode
 	body, ok := f.objects[key]
 	etag := f.etagLocked(key)
+	vid := f.versions[key]
 	ignoreRange := f.IgnoreRange
 	f.mu.Unlock()
 	if !ok {
@@ -225,6 +229,9 @@ func (f *Fake) GetObject(_ context.Context, in *s3.GetObjectInput, _ ...func(*s3
 		body = f.GetBody(key, body)
 	}
 	out := &s3.GetObjectOutput{ETag: aws.String(etag), AcceptRanges: aws.String("bytes")}
+	if vid != "" {
+		out.VersionId = aws.String(vid)
+	}
 	if start, end, ok := parseRange(aws.ToString(in.Range)); ok && !ignoreRange {
 		if start >= int64(len(body)) {
 			return nil, httpError(http.StatusRequestedRangeNotSatisfiable, "InvalidRange",
@@ -287,6 +294,14 @@ func (f *Fake) SetETag(key, etag string) {
 	f.etags[key] = etag
 }
 
+// SetVersionID makes GetObject report key's VersionId as vid until its next
+// put or Store, as a versioned bucket does; by default none is reported.
+func (f *Fake) SetVersionID(key, vid string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.versions[key] = vid
+}
+
 // Store seeds or overwrites an object directly, bypassing the hooks. Like an
 // upload without a checksum algorithm, it leaves no stored checksum.
 func (f *Fake) Store(key string, body []byte) {
@@ -295,6 +310,7 @@ func (f *Fake) Store(key string, body []byte) {
 	f.objects[key] = append([]byte(nil), body...)
 	delete(f.sums, key)
 	delete(f.etags, key)
+	delete(f.versions, key)
 }
 
 // StoreAt seeds or overwrites an object with a LastModified time, so listing
@@ -307,6 +323,7 @@ func (f *Fake) StoreAt(key string, body []byte, mod time.Time) {
 	f.mod[key] = mod
 	delete(f.sums, key)
 	delete(f.etags, key)
+	delete(f.versions, key)
 }
 
 // Delete removes an object directly.
@@ -317,6 +334,7 @@ func (f *Fake) Delete(key string) {
 	delete(f.mod, key)
 	delete(f.sums, key)
 	delete(f.etags, key)
+	delete(f.versions, key)
 }
 
 // ListObjectsV2 lists stored keys under the requested Prefix in lexical order,
@@ -388,6 +406,7 @@ func (f *Fake) DeleteObjects(_ context.Context, in *s3.DeleteObjectsInput, _ ...
 		delete(f.mod, key)
 		delete(f.sums, key)
 		delete(f.etags, key)
+		delete(f.versions, key)
 		f.delOrder = append(f.delOrder, key)
 		if !quiet {
 			out.Deleted = append(out.Deleted, types.DeletedObject{Key: aws.String(key)})
