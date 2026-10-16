@@ -34,6 +34,14 @@ func SetRemoveAllFn(fn func(path string) error) (restore func()) {
 	return func() { removeAllFn = orig }
 }
 
+// SetRemoveFn swaps the Remove used on kept prefixes and returns a restore
+// func — lets black-box tests make a prefix file undeletable.
+func SetRemoveFn(fn func(name string) error) (restore func()) {
+	orig := removeFn
+	removeFn = fn
+	return func() { removeFn = orig }
+}
+
 // SetGOOS makes pull behave as if it ran on goos and returns a restore func.
 func SetGOOS(name string) (restore func()) {
 	orig := goos

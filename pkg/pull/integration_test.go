@@ -6,7 +6,9 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
@@ -14,6 +16,7 @@ import (
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
+	"github.com/aws/smithy-go"
 
 	"github.com/hurricanehrndz/pinsync/pkg/pull"
 	"github.com/hurricanehrndz/pinsync/pkg/push"
@@ -250,4 +253,76 @@ func TestPullWithManifestRustFS(t *testing.T) {
 		}
 		assertTree(t, fresh, v3)
 	})
+}
+
+// TestPullResumeRustFS cuts a download off against a real S3 implementation
+// and resumes it: the server must honour a ranged GET with IfMatch, answer a
+// stale IfMatch with 412, and label the range with Content-Range.
+func TestPullResumeRustFS(t *testing.T) {
+	client := s3test.StartRustFS(t)
+	bucket := s3test.CreateBucket(t, client, "pinsync-resume")
+	ctx := context.Background()
+	files := map[string]string{bigPath: bigContent(bigSize), "a.txt": "alpha"}
+	root := t.TempDir()
+	for rel, content := range files {
+		writeFile(t, root, rel, content, 0o644)
+	}
+	if _, err := push.Push(ctx, client, bucket, prefix, root, push.Options{}); err != nil {
+		t.Fatalf("Push: %v", err)
+	}
+	dest := filepath.Join(t.TempDir(), "dest")
+
+	first := &recordingClient{S3API: client, cutKey: bigKey, cut: cutAt, onCut: func() error { return errReset }}
+	if _, err := pull.Pull(ctx, first, bucket, prefix, dest, pull.Options{Parallel: 1}); !errors.Is(err, errReset) {
+		t.Fatalf("cut-off Pull = %v, want %v", err, errReset)
+	}
+
+	// What the server does with the requests a resume makes.
+	head, err := client.HeadObject(ctx, &s3.HeadObjectInput{Bucket: aws.String(bucket), Key: aws.String(bigKey)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	etag := aws.ToString(head.ETag)
+	rng := aws.String(fmt.Sprintf("bytes=%d-", cutAt))
+	out, err := client.GetObject(ctx, &s3.GetObjectInput{
+		Bucket: aws.String(bucket), Key: aws.String(bigKey), Range: rng, IfMatch: aws.String(etag),
+	})
+	if err != nil {
+		t.Fatalf("ranged GET with the current ETag: %v", err)
+	}
+	_ = out.Body.Close()
+	t.Logf("ranged GET: ETag %s, Content-Range %q, Content-Length %d",
+		etag, aws.ToString(out.ContentRange), aws.ToInt64(out.ContentLength))
+	if want := fmt.Sprintf("bytes %d-%d/%d", cutAt, bigSize-1, bigSize); aws.ToString(out.ContentRange) != want {
+		t.Errorf("Content-Range = %q, want %q", aws.ToString(out.ContentRange), want)
+	}
+	_, err = client.GetObject(ctx, &s3.GetObjectInput{
+		Bucket: aws.String(bucket), Key: aws.String(bigKey), Range: rng, IfMatch: aws.String(`"0123456789abcdef0123456789abcdef"`),
+	})
+	var re interface{ HTTPStatusCode() int }
+	var ae smithy.APIError
+	if !errors.As(err, &re) || re.HTTPStatusCode() != http.StatusPreconditionFailed || !errors.As(err, &ae) {
+		t.Errorf("ranged GET with a stale ETag = %v, want a 412 API error", err)
+	} else {
+		t.Logf("stale IfMatch: HTTP %d, code %s", re.HTTPStatusCode(), ae.ErrorCode())
+	}
+
+	second := &recordingClient{S3API: client}
+	stats, err := pull.Pull(ctx, second, bucket, prefix, dest, pull.Options{Parallel: 1})
+	if err != nil {
+		t.Fatalf("resumed Pull: %v", err)
+	}
+	g := second.gets(bigKey)
+	if len(g) != 1 || g[0].rng != aws.ToString(rng) || g[0].ifMatch != etag {
+		t.Errorf("resumed GETs = %+v, want one for %s if-match %s", g, aws.ToString(rng), etag)
+	}
+	if total := first.bytesRead(bigKey) + second.bytesRead(bigKey); total != bigSize {
+		t.Errorf("object bytes fetched over both pulls = %d, want %d", total, bigSize)
+	}
+	if stats.Resumed != 1 || stats.Reused != 1 {
+		t.Errorf("stats = %+v, want Resumed=1 Reused=1", stats)
+	}
+	assertTree(t, dest, files)
+	assertNoLeftovers(t, dest)
+	assertNoPartial(t, dest)
 }

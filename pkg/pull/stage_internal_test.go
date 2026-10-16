@@ -36,7 +36,7 @@ func TestStageRefusesExistingStagingTree(t *testing.T) {
 	if err = os.Mkdir(s.tmp, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	live, err := hashTree(dest)
+	live, err := hashTree(dest, "")
 	if err != nil {
 		t.Fatal(err)
 	}

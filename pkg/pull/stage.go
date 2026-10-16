@@ -5,11 +5,13 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
+	"hash"
 	"io"
 	"io/fs"
 	"os"
 	"path"
 	"path/filepath"
+	"slices"
 	"sync/atomic"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -38,7 +40,7 @@ func (e *stagedMismatchError) Error() string {
 
 // counters aggregates per-entry outcomes across the staging workers.
 type counters struct {
-	downloaded, linked, copied, reused atomic.Int64
+	downloaded, linked, copied, reused, resumed atomic.Int64
 }
 
 // job is one manifest entry and how stage reconciles it.
@@ -47,6 +49,10 @@ type job struct {
 	act  action
 	mode fs.FileMode
 	live fs.FileMode // the live file's mode, for actLink and actCopy
+
+	// resume lets an actDownload keep a prefix if cut off and continue a
+	// kept one (see resumeSlots).
+	resume bool
 }
 
 // stage assembles the complete fresh tree in s.tmp, a sibling of dest on the
@@ -55,18 +61,23 @@ type job struct {
 // before any download, and the partial tree is removed between the two
 // phases: from then on s.tmp holds everything it could supply, so a failure
 // can keep s.tmp in its place without losing anything (see keepStaged; a
-// partial tree that cannot be removed is kept instead).
+// partial tree that cannot be removed is kept instead). That includes the
+// kept prefixes of cut-off downloads, which move into s.tmp's resume
+// directory first; that directory is removed once staging succeeds.
 func (s *syncer) stage(ctx context.Context, m *manifest.Manifest, live map[string]localFile,
 	partial map[contentKey]leftover,
 ) (Stats, error) {
+	resumable := resumeSlots(m)
 	var local, remote []job
 	for _, f := range m.Files {
 		act, mode, err := classify(f, live, partial)
 		if err != nil {
 			return Stats{}, err
 		}
-		j := job{f, act, mode, live[f.Path].mode}
+		j := job{f: f, act: act, mode: mode, live: live[f.Path].mode}
 		if act == actDownload {
+			// Only S3 downloads resume; ReplaceFromDirectory copies locally.
+			j.resume = s.client != nil && resumable(f)
 			remote = append(remote, j)
 		} else {
 			local = append(local, j)
@@ -85,6 +96,7 @@ func (s *syncer) stage(ctx context.Context, m *manifest.Manifest, live map[strin
 	if err := s.stageAll(ctx, local, partial, &c); err != nil {
 		return Stats{}, err
 	}
+	s.adoptPrefixes(remote)
 	// A partial tree that cannot be removed costs only what it would save: if
 	// this attempt fails, keepStaged sees it still there and deletes s.tmp
 	// rather than mixing the two, and a later pull removes it.
@@ -94,12 +106,42 @@ func (s *syncer) stage(ctx context.Context, m *manifest.Manifest, live map[strin
 	if err := s.stageAll(ctx, remote, partial, &c); err != nil {
 		return Stats{}, err
 	}
+	if slices.ContainsFunc(remote, func(j job) bool { return j.resume }) {
+		if err := s.clearResumeDir(); err != nil {
+			return Stats{}, err
+		}
+	}
 	return Stats{
 		Downloaded: int(c.downloaded.Load()),
 		Linked:     int(c.linked.Load()),
 		Copied:     int(c.copied.Load()),
 		Reused:     int(c.reused.Load()),
+		Resumed:    int(c.resumed.Load()),
 	}, nil
+}
+
+// clearResumeDir removes the staging tree's resume directory, which must go
+// before VerifyTree. Every resumable download installed its file and dropped
+// its sidecar, so it holds at most what one that fell back to a plain
+// download could not remove (see downloadResumable). Rather than failing the
+// pull, that is moved aside into the partial tree, for a later pull to adopt
+// or remove. Only a file that can be neither removed nor moved fails the
+// pull; it could not have left the staging tree in the swap either. Moving
+// it aside can create the partial tree, so if this pull then fails anyway,
+// keepStaged deletes the staging tree rather than keeping it: that costs
+// this pull's downloads, and only when a prefix is already stuck.
+func (s *syncer) clearResumeDir() error {
+	dir := filepath.Join(s.tmp, resumeDir)
+	err := removeAllFn(dir)
+	if err == nil {
+		return nil
+	}
+	s.logger.Warn("could not remove leftover partial downloads; moving them aside", "path", dir, "error", err)
+	stashPrefixes(s.tmp, s.partial, s.logger)
+	if err := removeAllFn(dir); err != nil {
+		return fmt.Errorf("pull: removing the staging tree's resume directory: %w", err)
+	}
+	return nil
 }
 
 // stageAll stages jobs on up to s.parallel workers.
@@ -161,10 +203,14 @@ func (s *syncer) stageEntry(ctx context.Context, j job, partial map[contentKey]l
 	}
 	switch j.act {
 	case actDownload:
-		if err := s.fetch(ctx, j.f, dst, j.mode); err != nil {
+		resumed, err := s.fetch(ctx, j, dst)
+		if err != nil {
 			return err
 		}
 		c.downloaded.Add(1)
+		if resumed {
+			c.resumed.Add(1)
+		}
 	case actReuse:
 		lo := partial[contentKey{j.f.SHA256, j.f.Size}]
 		src := filepath.Join(s.partial, filepath.FromSlash(lo.path))
@@ -213,9 +259,23 @@ func (s *syncer) linkOrCopy(src, from string, j job, dst string, copyOnly bool) 
 	return false, copyFile(src, from, j.f, dst, j.mode)
 }
 
-// download fetches one object whole (never ranged — a full-object checksum
-// needs full-object bytes) and writes it into staging with writeVerified.
-func (s *syncer) download(ctx context.Context, f manifest.File, dst string, mode fs.FileMode) error {
+// download fetches one object into staging and reports whether it resumed a
+// kept prefix. A whole-object GET asks S3 to check its full-object checksum
+// as well as writeVerified's SHA256. Objects of at least minResumeSize go
+// through downloadResumable instead: a cut-off one is kept and continued by a
+// ranged GET, which carries no full-object checksum, so the manifest's SHA256
+// over the kept and the new bytes is then the only check (VerifyTree still
+// re-reads the file before the swap).
+func (s *syncer) download(ctx context.Context, j job, dst string) (bool, error) {
+	if j.resume {
+		return s.downloadResumable(ctx, j.f, dst, j.mode)
+	}
+	return false, s.downloadWhole(ctx, j.f, dst, j.mode)
+}
+
+// downloadWhole fetches f with one whole-object GET and writes it to dst
+// with writeVerified, keeping nothing to resume.
+func (s *syncer) downloadWhole(ctx context.Context, f manifest.File, dst string, mode fs.FileMode) error {
 	key := path.Join(s.prefix, f.Path)
 	out, err := s.client.GetObject(ctx, &s3.GetObjectInput{
 		Bucket:       aws.String(s.bucket),
@@ -235,24 +295,24 @@ func (s *syncer) download(ctx context.Context, f manifest.File, dst string, mode
 // copyFromSource stages one entry from ReplaceFromDirectory's source tree.
 // The source file must be a regular file; its bytes are verified like a
 // download.
-func (s *syncer) copyFromSource(_ context.Context, f manifest.File, dst string, mode fs.FileMode) error {
-	src := filepath.Join(s.source, filepath.FromSlash(f.Path))
+func (s *syncer) copyFromSource(_ context.Context, j job, dst string) (bool, error) {
+	src := filepath.Join(s.source, filepath.FromSlash(j.f.Path))
 	info, err := os.Lstat(src)
 	if err != nil {
-		return fmt.Errorf("pull: source %s: %w", f.Path, err)
+		return false, fmt.Errorf("pull: source %s: %w", j.f.Path, err)
 	}
 	if !info.Mode().IsRegular() {
-		return fmt.Errorf("pull: source %s: not a regular file", f.Path)
+		return false, fmt.Errorf("pull: source %s: not a regular file", j.f.Path)
 	}
 	in, err := os.Open(src)
 	if err != nil {
-		return err
+		return false, err
 	}
 	defer func() { _ = in.Close() }() // read-only; nothing to do about a close error
-	if err := writeVerified(in, f, dst, mode); err != nil {
-		return fmt.Errorf("pull: copying source %s: %w", f.Path, err)
+	if err := writeVerified(in, j.f, dst, j.mode); err != nil {
+		return false, fmt.Errorf("pull: copying source %s: %w", j.f.Path, err)
 	}
-	return nil
+	return false, nil
 }
 
 // writeVerified streams r into the staging file dst while hashing, reading at
@@ -274,6 +334,14 @@ func writeVerified(r io.Reader, f manifest.File, dst string, mode fs.FileMode) e
 	if err := fh.Close(); err != nil {
 		return err
 	}
+	if err := checkStaged(f, n, h); err != nil {
+		return err
+	}
+	return chmod(dst, mode)
+}
+
+// checkStaged compares n staged bytes hashed into h with f's size and SHA256.
+func checkStaged(f manifest.File, n int64, h hash.Hash) error {
 	switch {
 	case n > f.Size:
 		return &stagedMismatchError{Path: f.Path, Detail: fmt.Sprintf("body exceeds the manifest's %d bytes", f.Size)}
@@ -283,7 +351,7 @@ func writeVerified(r io.Reader, f manifest.File, dst string, mode fs.FileMode) e
 	if got := hex.EncodeToString(h.Sum(nil)); got != f.SHA256 {
 		return &stagedMismatchError{Path: f.Path, Detail: fmt.Sprintf("bytes hash %s, manifest says %s", got, f.SHA256)}
 	}
-	return chmod(dst, mode)
+	return nil
 }
 
 // copyFile copies src, a file in the live or partial tree (named by from),

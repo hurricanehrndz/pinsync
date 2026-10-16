@@ -19,7 +19,7 @@ copy matches it.
 |---|---|---|
 | Deciding what changed | Size and modification time | SHA256 of the contents |
 | File permissions | Not stored | Recorded by push, applied by pull on Linux and macOS |
-| Interrupted download | Leaves a mix of old and new files | Destination untouched, and the next run reuses the files already downloaded |
+| Interrupted download | Leaves a mix of old and new files | Destination untouched, and the next run reuses the files already downloaded and resumes a large one cut off partway |
 | Download during an upload | Can mix files from two uploads | Detects the mismatch and fetches the newer snapshot |
 | Local file corrupted, same size | Kept if its mtime is newer | Caught by the hash and downloaded again |
 | Stray local files | Stay unless you pass `--delete` | Gone after the next pull |
@@ -91,9 +91,13 @@ the new tree next to the destination, then renames it into place:
 If the pull fails before the swap, from an error, a timeout or being killed,
 `/etc/myapp` stays as it was and the staged files move to
 `/etc/myapp.pinsync-partial/`. The next pull hashes them again, uses any whose
-bytes match a manifest entry, and downloads only the rest. A file cut off
-mid-download fails the hash and is fetched again in full. A successful pull
-removes the partial tree.
+bytes match a manifest entry, and downloads only the rest. A file of 1 MiB or
+more cut off mid-download is kept as well, with the object's ETag, and the
+next pull asks S3 only for the missing bytes, with a ranged GET that fails if
+the object's ETag has changed. The whole file's SHA256 must still match the
+manifest. If the object changed, the server ignores the range, or the hash
+fails, that pull downloads the file again in full. A smaller file cut off is
+fetched again in full. A successful pull removes the partial tree.
 
 Pull owns `/etc/myapp`. A file you drop in there by hand isn't in the manifest,
 so the next pull removes it.
@@ -138,7 +142,7 @@ pinsync pull -bucket my-bucket -prefix cfg/prod /etc/myapp
 ```
 
 ```
-pulled 3 files: 1 downloaded, 0 reused, 2 linked, 0 copied
+pulled 3 files: 1 downloaded (0 resumed), 0 reused, 2 linked, 0 copied
 ```
 
 Pull runs on Linux, macOS and Windows. A pull with nothing to do downloads
@@ -257,7 +261,8 @@ retried after the callback.
 
 - `pull.Recover(ctx, dest, logger)` finishes or rolls back an interrupted swap
   using only `dest` and its siblings. It never promotes the unverified staging
-  tree; it keeps it as `dest.pinsync-partial` for the next pull to reuse.
+  tree; it keeps it as `dest.pinsync-partial` for the next pull to reuse,
+  including any download cut off partway.
 - `pull.Siblings(dest)` lists every directory pull creates beside `dest`
   (`.pinsync-tmp`, `.pinsync-old` and `.pinsync-partial`), for overlap checks
   or permission repair.
