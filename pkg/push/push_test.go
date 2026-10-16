@@ -1,3 +1,7 @@
+//go:build !windows
+
+// Push refuses Windows; guard_test.go's TestPushRefusesWindows runs there.
+
 package push_test
 
 import (
