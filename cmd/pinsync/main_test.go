@@ -28,6 +28,8 @@ func TestParseArgs(t *testing.T) {
 		{"missing positional", []string{"push", "-bucket", "b"}, "root directory"},
 		{"pull missing positional", []string{"pull", "-bucket", "b"}, "destination directory"},
 		{"extra positional", []string{"pull", "-bucket", "b", "d1", "d2"}, "exactly one"},
+		{"flag after positional", []string{"push", "root", "-bucket", "b"}, `flag -bucket follows "root"`},
+		{"dash root after --", []string{"push", "-bucket", "b", "--", "-root"}, ""},
 		{"valid push", []string{"push", "-bucket", "b", "-prefix", "p", "root"}, ""},
 		{"push with full", []string{"push", "-bucket", "b", "-full", "root"}, ""},
 		{"full flag on pull rejected", []string{"pull", "-bucket", "b", "-full", "dest"}, "not defined"},
@@ -286,10 +288,39 @@ func TestRunVersion(t *testing.T) {
 	}
 }
 
+// TestParseArgsHelp checks each subcommand's -h names its positional and
+// purpose, which the flag package's default usage leaves out.
 func TestParseArgsHelp(t *testing.T) {
-	_, err := parseArgs([]string{"push", "-h"}, io.Discard)
-	if !errors.Is(err, flag.ErrHelp) {
-		t.Fatalf("parseArgs(-h) = %v, want flag.ErrHelp", err)
+	for _, tc := range []struct{ sub, want string }{
+		{"push", "usage: pinsync push -bucket B [flags] <root>\n\npublish root"},
+		{"pull", "usage: pinsync pull -bucket B [flags] <dest>\n\nmirror"},
+		{"prune", "usage: pinsync prune -bucket B [flags]\n\ndelete unreferenced"},
+	} {
+		var out strings.Builder
+		_, err := parseArgs([]string{tc.sub, "-h"}, &out)
+		if !errors.Is(err, flag.ErrHelp) {
+			t.Fatalf("parseArgs(%s -h) = %v, want flag.ErrHelp", tc.sub, err)
+		}
+		if !strings.HasPrefix(out.String(), tc.want) || !strings.Contains(out.String(), "-bucket string") {
+			t.Errorf("%s -h output = %q, want prefix %q and the flag list", tc.sub, out.String(), tc.want)
+		}
+	}
+}
+
+func TestRunHelp(t *testing.T) {
+	for _, arg := range []string{"-h", "-help", "--help", "help"} {
+		var out strings.Builder
+		if err := run(context.Background(), []string{arg}, io.Discard, &out); err != nil {
+			t.Fatalf("run(%s): %v", arg, err)
+		}
+		if out.String() != usage+"\n" {
+			t.Errorf("run(%s) output = %q, want the top-level usage", arg, out.String())
+		}
+	}
+	var out strings.Builder
+	err := run(context.Background(), []string{"help", "pull"}, io.Discard, &out)
+	if !errors.Is(err, flag.ErrHelp) || !strings.HasPrefix(out.String(), "usage: pinsync pull") {
+		t.Errorf("run(help pull) = %v, output %q; want pull's usage and flag.ErrHelp", err, out.String())
 	}
 }
 
