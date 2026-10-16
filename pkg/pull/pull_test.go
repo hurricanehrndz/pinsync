@@ -214,10 +214,7 @@ func TestPullNoOpHardlinks(t *testing.T) {
 	dest := filepath.Join(t.TempDir(), "dest")
 	mustPull(t, fake, dest)
 
-	before, err := os.Stat(filepath.Join(dest, "a.txt"))
-	if err != nil {
-		t.Fatal(err)
-	}
+	before := fileID(t, filepath.Join(dest, "a.txt"))
 	stats := mustPull(t, fake, dest)
 	if stats.Downloaded != 0 || stats.Linked != 2 {
 		t.Errorf("stats = %+v, want Linked=2 Downloaded=0", stats)

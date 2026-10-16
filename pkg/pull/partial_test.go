@@ -420,10 +420,7 @@ func TestPullNeverLinksReadOnlyFilesOnWindows(t *testing.T) {
 	if err := os.Chmod(liveA, 0o444); err != nil {
 		t.Fatal(err)
 	}
-	before, err := os.Stat(liveA)
-	if err != nil {
-		t.Fatal(err)
-	}
+	before := fileID(t, liveA)
 	leftoverB := filepath.Join(partialDir(dest), "b.txt")
 	writeFile(t, partialDir(dest), "b.txt", "bravo", 0o644)
 	control := filepath.Join(t.TempDir(), "control")
@@ -445,6 +442,24 @@ func TestPullNeverLinksReadOnlyFilesOnWindows(t *testing.T) {
 	if ctl, err := os.Stat(control); err != nil || sameFile(t, filepath.Join(dest, "b.txt"), ctl) {
 		t.Errorf("read-only partial b.txt was linked into dest (stat err %v)", err)
 	}
+}
+
+// fileID stats p through an open handle, pinning the file p names now. On
+// Windows os.Stat records only the path and os.SameFile reads the file ID
+// from it when called, so an os.Stat taken before a swap compares the file
+// that p names after it (os/types_windows.go, loadFileId).
+func fileID(t *testing.T, p string) os.FileInfo {
+	t.Helper()
+	fh, err := os.Open(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = fh.Close() }()
+	info, err := fh.Stat()
+	if err != nil {
+		t.Fatal(err)
+	}
+	return info
 }
 
 func sameFile(t *testing.T, p string, want os.FileInfo) bool {
