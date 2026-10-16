@@ -205,6 +205,11 @@ func TestRecoverLeftoverSiblings(t *testing.T) {
 		{"dest missing, tmp only", false, true, false, nil},
 		{"nothing to do", true, false, false, map[string]string{"live.txt": "live"}},
 	} {
+		// A leftover staging tree is kept, never promoted, as the partial tree.
+		var wantPartial map[string]string
+		if tc.tmp {
+			wantPartial = map[string]string{"tmp.txt": "unverified"}
+		}
 		t.Run(tc.name, func(t *testing.T) {
 			dest := filepath.Join(t.TempDir(), "dest")
 			if tc.dest {
@@ -220,6 +225,11 @@ func TestRecoverLeftoverSiblings(t *testing.T) {
 				t.Fatalf("Recover: %v", err)
 			}
 			assertNoLeftovers(t, dest)
+			if wantPartial == nil {
+				assertNoPartial(t, dest)
+			} else {
+				assertTree(t, partialDir(dest), wantPartial)
+			}
 			if tc.want == nil {
 				if _, err := os.Lstat(dest); err == nil {
 					t.Error("Recover promoted the unverified staging tree")
@@ -462,19 +472,21 @@ func TestReplaceFromDirectoryRejectsOverlap(t *testing.T) {
 		})
 	}
 
-	// Recovery deletes a stale .pinsync-old next to a live dest; a source
-	// there must be refused before recovery runs.
-	t.Run("source is the old sibling", func(t *testing.T) {
-		dest := filepath.Join(t.TempDir(), "dest")
-		writeFile(t, dest, "live.txt", "live", 0o644)
-		src := dest + ".pinsync-old"
-		writeFile(t, src, "a.txt", "alpha", 0o644)
-		_, err := pull.ReplaceFromDirectory(context.Background(), src, dest, encodeManifest(t, files), pull.Options{})
-		if err == nil || !strings.Contains(err.Error(), "overlaps") {
-			t.Fatalf("ReplaceFromDirectory = %v, want overlap error", err)
-		}
-		assertTree(t, src, files)
-	})
+	// Recovery and staging rename or delete every sibling next to a live
+	// dest; a source there must be refused before either runs.
+	for _, suffix := range []string{".pinsync-tmp", ".pinsync-old", ".pinsync-partial"} {
+		t.Run("source is the "+suffix+" sibling", func(t *testing.T) {
+			dest := filepath.Join(t.TempDir(), "dest")
+			writeFile(t, dest, "live.txt", "live", 0o644)
+			src := dest + suffix
+			writeFile(t, src, "a.txt", "alpha", 0o644)
+			_, err := pull.ReplaceFromDirectory(context.Background(), src, dest, encodeManifest(t, files), pull.Options{})
+			if err == nil || !strings.Contains(err.Error(), "overlaps") {
+				t.Fatalf("ReplaceFromDirectory = %v, want overlap error", err)
+			}
+			assertTree(t, src, files)
+		})
+	}
 
 	// Sources that only a symlink leads out of dest or its old sibling:
 	// recovery or the swap would delete the path out from under the copy.

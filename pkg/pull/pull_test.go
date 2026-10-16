@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"runtime"
+	"slices"
 	"strings"
 	"testing"
 
@@ -157,9 +158,15 @@ func assertTree(t *testing.T, dest string, files map[string]string) {
 	}
 }
 
+// assertNoLeftovers checks that no swap sibling (staging or old tree)
+// remains. The partial tree may: a failed pull keeps it on purpose, so check
+// it separately with assertNoPartial or readTree.
 func assertNoLeftovers(t *testing.T, dest string) {
 	t.Helper()
-	for _, p := range []string{dest + ".pinsync-tmp", dest + ".pinsync-old"} {
+	for _, p := range pull.Siblings(dest) {
+		if p == partialDir(dest) {
+			continue
+		}
 		if _, err := os.Lstat(p); err == nil {
 			t.Errorf("leftover directory %s", p)
 		}
@@ -388,10 +395,16 @@ func TestPullRetryConvergesOnManifestRace(t *testing.T) {
 
 	dest := filepath.Join(t.TempDir(), "dest")
 	stats := mustPull(t, fake, dest)
-	if stats.Downloaded != 1 {
-		t.Errorf("stats = %+v, want Downloaded=1", stats)
+	// The first attempt already holds the new bytes, so the retry reuses
+	// them instead of fetching the object again.
+	if stats.Reused != 1 || stats.Downloaded != 0 {
+		t.Errorf("stats = %+v, want Reused=1", stats)
+	}
+	if got := contentGets(fake); !slices.Equal(got, []string{"a.txt"}) {
+		t.Errorf("content GETs = %v, want a.txt once", got)
 	}
 	assertTree(t, dest, map[string]string{"a.txt": "new-content"})
+	assertNoPartial(t, dest)
 }
 
 func TestPullCrashRecovery(t *testing.T) {
@@ -408,6 +421,7 @@ func TestPullCrashRecovery(t *testing.T) {
 		mustPull(t, fake, dest)
 		assertTree(t, dest, files)
 		assertNoLeftovers(t, dest)
+		assertNoPartial(t, dest)
 	})
 
 	t.Run("dest missing, old present", func(t *testing.T) {
@@ -618,6 +632,7 @@ func TestDryRunClassifiesAndIsReadOnly(t *testing.T) {
 	}
 
 	assertNoLeftovers(t, dest) // no .pinsync-tmp / .pinsync-old created
+	assertNoPartial(t, dest)
 
 	if after := snapshot(t, dest); !reflect.DeepEqual(after, before) {
 		t.Errorf("DryRun mutated dest:\n before %v\n after  %v", before, after)

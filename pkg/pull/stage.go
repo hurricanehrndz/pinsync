@@ -38,55 +38,109 @@ func (e *stagedMismatchError) Error() string {
 
 // counters aggregates per-entry outcomes across the staging workers.
 type counters struct {
-	downloaded, linked, copied atomic.Int64
+	downloaded, linked, copied, reused atomic.Int64
+}
+
+// job is one manifest entry and how stage reconciles it.
+type job struct {
+	f    manifest.File
+	act  action
+	mode fs.FileMode
+	live fs.FileMode // the live file's mode, for actLink and actCopy
 }
 
 // stage assembles the complete fresh tree in s.tmp, a sibling of dest on the
 // same filesystem. Every manifest entry is staged and verified; nothing under
-// dest is ever modified.
-func (s *syncer) stage(ctx context.Context, m *manifest.Manifest, live map[string]localFile) (Stats, error) {
-	if err := os.MkdirAll(s.tmp, 0o755); err != nil {
+// dest is ever modified. Entries already on disk, live or partial, are staged
+// before any download, and the partial tree is removed between the two
+// phases: from then on s.tmp holds everything it could supply, so a failure
+// can keep s.tmp in its place without losing anything (see keepStaged; a
+// partial tree that cannot be removed is kept instead).
+func (s *syncer) stage(ctx context.Context, m *manifest.Manifest, live map[string]localFile,
+	partial map[contentKey]leftover,
+) (Stats, error) {
+	var local, remote []job
+	for _, f := range m.Files {
+		act, mode, err := classify(f, live, partial)
+		if err != nil {
+			return Stats{}, err
+		}
+		j := job{f, act, mode, live[f.Path].mode}
+		if act == actDownload {
+			remote = append(remote, j)
+		} else {
+			local = append(local, j)
+		}
+	}
+	// A staging tree that is already there may hold hardlinks to live files;
+	// staging into it could write through them, so it is refused, never
+	// reused. Recovery and keepStaged clear it before any attempt.
+	if err := os.MkdirAll(filepath.Dir(s.tmp), 0o755); err != nil {
 		return Stats{}, err
 	}
-	var c counters
-	g, gctx := errgroup.WithContext(ctx)
-	g.SetLimit(s.parallel)
-	for _, f := range m.Files {
-		g.Go(func() error { return s.stageEntry(gctx, f, live, &c) })
+	if err := os.Mkdir(s.tmp, 0o755); err != nil {
+		return Stats{}, fmt.Errorf("pull: creating staging directory: %w", err)
 	}
-	if err := g.Wait(); err != nil {
+	var c counters
+	if err := s.stageAll(ctx, local, partial, &c); err != nil {
+		return Stats{}, err
+	}
+	// A partial tree that cannot be removed costs only what it would save: if
+	// this attempt fails, keepStaged sees it still there and deletes s.tmp
+	// rather than mixing the two, and a later pull removes it.
+	if err := removeAllFn(s.partial); err != nil {
+		s.logger.Warn("could not remove files kept from a failed pull; continuing", "path", s.partial, "error", err)
+	}
+	if err := s.stageAll(ctx, remote, partial, &c); err != nil {
 		return Stats{}, err
 	}
 	return Stats{
 		Downloaded: int(c.downloaded.Load()),
 		Linked:     int(c.linked.Load()),
 		Copied:     int(c.copied.Load()),
+		Reused:     int(c.reused.Load()),
 	}, nil
+}
+
+// stageAll stages jobs on up to s.parallel workers.
+func (s *syncer) stageAll(ctx context.Context, jobs []job, partial map[contentKey]leftover, c *counters) error {
+	g, gctx := errgroup.WithContext(ctx)
+	g.SetLimit(s.parallel)
+	for _, j := range jobs {
+		g.Go(func() error { return s.stageEntry(gctx, j, partial, c) })
+	}
+	return g.Wait()
 }
 
 // action is how one manifest entry is reconciled against the live tree.
 type action int
 
 const (
-	actDownload action = iota // live file is absent or its content or size differs
+	actDownload action = iota // neither the live file nor the partial tree has the content
 	actCopy                   // content matches but the mode does not (never on Windows)
 	actLink                   // content and mode match; hardlink the live file
+	actReuse                  // only the partial tree has the content; stage it from there
 )
 
 // classify decides, without touching the filesystem, how a manifest entry
-// should be staged against the live tree, and returns the parsed target mode.
-// It is the single decision shared by real staging and the dry-run preview:
-// download when the live file is absent or its content or size differs, copy on a
-// mode-only change (modes are not meaningful on Windows, so skipped there),
-// otherwise hardlink. The hardlink→copy runtime fallback is the stager's, not
-// classify's — classify reports only the intended action.
-func classify(f manifest.File, live map[string]localFile) (action, fs.FileMode, error) {
+// should be staged against the live tree and the partial tree's content
+// index, and returns the parsed target mode. It is the single decision shared
+// by real staging and the dry-run preview: when the live file is absent or
+// its content or size differs, reuse a partial file with the same content or
+// else download; copy on a mode-only change (modes are not meaningful on
+// Windows, so skipped there), otherwise hardlink. The hardlink→copy runtime
+// fallback is the stager's, not classify's — classify reports only the
+// intended action.
+func classify(f manifest.File, live map[string]localFile, partial map[contentKey]leftover) (action, fs.FileMode, error) {
 	mode, err := f.FileMode()
 	if err != nil {
 		return 0, 0, err
 	}
 	lf, ok := live[f.Path]
 	if !ok || lf.hash != f.SHA256 || lf.size != f.Size {
+		if _, ok := partial[contentKey{f.SHA256, f.Size}]; ok {
+			return actReuse, mode, nil
+		}
 		return actDownload, mode, nil
 	}
 	if goos != "windows" && lf.mode != mode {
@@ -96,43 +150,67 @@ func classify(f manifest.File, live map[string]localFile) (action, fs.FileMode, 
 }
 
 // stageEntry stages one manifest entry: hardlink when content and mode match
-// the live file (content only on Windows), copy locally on a mode-only
-// change (never hardlink-then-chmod, which would mutate the live inode), and
-// download otherwise. Hardlink failures fall back to a copy.
-func (s *syncer) stageEntry(ctx context.Context, f manifest.File, live map[string]localFile, c *counters) error {
-	act, mode, err := classify(f, live)
-	if err != nil {
-		return err
-	}
-	dst := filepath.Join(s.tmp, filepath.FromSlash(f.Path))
+// the live file or a partial file (content only on Windows), copy locally on
+// a mode-only change (never hardlink-then-chmod, which would mutate an inode
+// the live tree or another staged entry may share) or a read-only file on
+// Windows, and download otherwise. Hardlink failures fall back to a copy.
+func (s *syncer) stageEntry(ctx context.Context, j job, partial map[contentKey]leftover, c *counters) error {
+	dst := filepath.Join(s.tmp, filepath.FromSlash(j.f.Path))
 	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
 		return err
 	}
-	if act == actDownload {
-		if err := s.fetch(ctx, f, dst, mode); err != nil {
+	switch j.act {
+	case actDownload:
+		if err := s.fetch(ctx, j.f, dst, j.mode); err != nil {
 			return err
 		}
 		c.downloaded.Add(1)
-		return nil
-	}
-	src := filepath.Join(s.dest, filepath.FromSlash(f.Path))
-	if act == actCopy {
-		if err := copyFile(src, f, dst, mode); err != nil {
+	case actReuse:
+		lo := partial[contentKey{j.f.SHA256, j.f.Size}]
+		src := filepath.Join(s.partial, filepath.FromSlash(lo.path))
+		copyOnly := (goos != "windows" && lo.mode != j.mode) || readOnlyOnWindows(lo.mode)
+		if _, err := s.linkOrCopy(src, "partial", j, dst, copyOnly); err != nil {
 			return err
 		}
-		c.copied.Add(1)
-		return nil
-	}
-	if err := linkFn(src, dst); err != nil {
-		s.logger.Debug("hardlink failed; copying instead", "path", f.Path, "error", err)
-		if err := copyFile(src, f, dst, mode); err != nil {
+		c.reused.Add(1)
+	default:
+		src := filepath.Join(s.dest, filepath.FromSlash(j.f.Path))
+		linked, err := s.linkOrCopy(src, "live", j, dst, j.act == actCopy || readOnlyOnWindows(j.live))
+		if err != nil {
 			return err
 		}
-		c.copied.Add(1)
-		return nil
+		if linked {
+			c.linked.Add(1)
+		} else {
+			c.copied.Add(1)
+		}
 	}
-	c.linked.Add(1)
 	return nil
+}
+
+// readOnlyOnWindows reports a file that must be copied rather than linked
+// because it carries the Windows read-only attribute (Go reports it as a
+// missing owner-write bit). Every hardlink shares that attribute, and removing
+// a read-only file can clear it first (os.RemoveAll's fallback where the
+// filesystem cannot delete it as is), so removing the partial or old tree
+// would clear it on the file in dest. Never sharing a read-only file between
+// trees rules that out, at the cost of copying such files on every pull.
+func readOnlyOnWindows(mode fs.FileMode) bool {
+	return goos == "windows" && mode&0o200 == 0
+}
+
+// linkOrCopy stages j from src, a file in the tree named from, at dst: a
+// hardlink unless copyOnly, falling back to a copy when the link fails. It
+// reports whether it linked.
+func (s *syncer) linkOrCopy(src, from string, j job, dst string, copyOnly bool) (bool, error) {
+	if !copyOnly {
+		err := linkFn(src, dst)
+		if err == nil {
+			return true, nil
+		}
+		s.logger.Debug("hardlink failed; copying instead", "path", j.f.Path, "error", err)
+	}
+	return false, copyFile(src, from, j.f, dst, j.mode)
 }
 
 // download fetches one object whole (never ranged — a full-object checksum
@@ -180,8 +258,10 @@ func (s *syncer) copyFromSource(_ context.Context, f manifest.File, dst string, 
 // writeVerified streams r into the staging file dst while hashing, reading at
 // most one byte past the declared size, and verifies length and SHA256
 // against the manifest entry. A long body fails without being read to EOF.
+// dst must not exist: an existing name in staging may be a hardlink to a
+// live file, and opening it for writing would change dest.
 func writeVerified(r io.Reader, f manifest.File, dst string, mode fs.FileMode) error {
-	fh, err := os.OpenFile(dst, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, mode)
+	fh, err := os.OpenFile(dst, os.O_WRONLY|os.O_CREATE|os.O_EXCL, mode)
 	if err != nil {
 		return err
 	}
@@ -206,17 +286,17 @@ func writeVerified(r io.Reader, f manifest.File, dst string, mode fs.FileMode) e
 	return chmod(dst, mode)
 }
 
-// copyFile copies the live file src into the staging tree with
-// writeVerified, so a live file that changed since it was hashed is never
-// read past the entry's declared size.
-func copyFile(src string, f manifest.File, dst string, mode fs.FileMode) error {
+// copyFile copies src, a file in the live or partial tree (named by from),
+// into the staging tree with writeVerified, so a file that changed since it
+// was hashed is never read past the entry's declared size.
+func copyFile(src, from string, f manifest.File, dst string, mode fs.FileMode) error {
 	in, err := os.Open(src)
 	if err != nil {
 		return err
 	}
 	defer func() { _ = in.Close() }() // read-only; nothing to do about a close error
 	if err := writeVerified(in, f, dst, mode); err != nil {
-		return fmt.Errorf("pull: copying live %s: %w", f.Path, err)
+		return fmt.Errorf("pull: copying %s %s: %w", from, f.Path, err)
 	}
 	return nil
 }

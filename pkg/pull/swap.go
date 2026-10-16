@@ -8,8 +8,12 @@ import (
 	"time"
 )
 
-// renameFn is a test seam for interrupting the swap between its renames.
-var renameFn = os.Rename
+// renameFn and removeAllFn are test seams for interrupting the swap between
+// its renames and for failing the renames and removals of sibling trees.
+var (
+	renameFn    = os.Rename
+	removeAllFn = os.RemoveAll
+)
 
 // swapBackoff is the initial pause between rename retries; it doubles per
 // attempt. A test seam.

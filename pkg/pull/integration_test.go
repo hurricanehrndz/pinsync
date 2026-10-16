@@ -51,10 +51,10 @@ func TestPullRustFS(t *testing.T) {
 	assertTree(t, dest, files)
 
 	// Corrupt in place (same size), delete a file, add extraneous junk.
-	if err := os.WriteFile(filepath.Join(dest, "a.txt"), []byte("XXXXX"), 0o644); err != nil {
+	if err = os.WriteFile(filepath.Join(dest, "a.txt"), []byte("XXXXX"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.Remove(filepath.Join(dest, "sub", "b.txt")); err != nil {
+	if err = os.Remove(filepath.Join(dest, "sub", "b.txt")); err != nil {
 		t.Fatal(err)
 	}
 	writeFile(t, dest, "extraneous.txt", "junk", 0o644)
@@ -164,6 +164,8 @@ func TestPullWithManifestRustFS(t *testing.T) {
 		}
 		assertTree(t, dest, v1)
 		assertNoLeftovers(t, dest)
+		// The verified v2 tree is kept for the next pull to reuse.
+		assertTree(t, partialDir(dest), v2)
 	})
 
 	t.Run("interrupted swap recovered offline", func(t *testing.T) {
@@ -186,6 +188,10 @@ func TestPullWithManifestRustFS(t *testing.T) {
 	})
 
 	t.Run("bounded bodies", func(t *testing.T) {
+		// Earlier failures kept the good v2 bytes, which would be reused instead of fetching the bad body.
+		if err := os.RemoveAll(partialDir(dest)); err != nil {
+			t.Fatal(err)
+		}
 		key := prefix + "/sub/b.txt"
 		for name, body := range map[string]string{"truncated": "BRA", "oversized": "BRAVO2" + strings.Repeat("x", 1<<20)} {
 			put(key, []byte(body))
@@ -196,6 +202,15 @@ func TestPullWithManifestRustFS(t *testing.T) {
 			assertNoLeftovers(t, dest)
 		}
 		put(key, []byte(v2["sub/b.txt"]))
+		// The partial now holds the cut-off bad body; it fails the hash, so
+		// the next pull must download sub/b.txt rather than reuse it.
+		plan, err := pull.DryRun(ctx, client, bucket, prefix, dest, pull.Options{})
+		if err != nil {
+			t.Fatalf("DryRun: %v", err)
+		}
+		if plan.Reused != 0 || len(plan.Download) != 1 || plan.Download[0] != "sub/b.txt" {
+			t.Errorf("plan = %+v, want sub/b.txt downloaded, nothing reused", plan)
+		}
 	})
 
 	t.Run("manifest limit", func(t *testing.T) {

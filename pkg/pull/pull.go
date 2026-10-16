@@ -4,7 +4,8 @@
 // the live tree, assembles a verified sibling tree (hardlink unchanged /
 // copy mode-changed / download changed), re-verifies that tree against the
 // manifest, and atomically swaps it in. On any failure before the swap the
-// destination is left byte-for-byte untouched.
+// destination is left byte-for-byte untouched, and the files staged so far
+// are kept beside it so the next run downloads only what is still missing.
 //
 // PullWithManifest also returns the exact manifest bytes it installed, and
 // Options.BeforeReplace lets a caller persist them before the swap.
@@ -22,7 +23,6 @@ import (
 	"io"
 	"io/fs"
 	"log/slog"
-	"os"
 	"path"
 	"path/filepath"
 	"runtime"
@@ -72,9 +72,10 @@ const (
 
 // Stats reports how each manifest entry was staged.
 type Stats struct {
-	Downloaded int // fetched from S3 (or, for ReplaceFromDirectory, the source tree)
+	Downloaded int // fetched from S3 (or, for ReplaceFromDirectory, the source tree); excludes Reused, unlike Plan.Download
 	Linked     int // hardlink into the live tree's file
 	Copied     int // copied locally (mode change or hardlink fallback)
+	Reused     int // staged from a failed pull's leftover files instead of downloaded
 	Total      int // manifest entries
 }
 
@@ -86,9 +87,19 @@ type Result struct {
 }
 
 const (
-	tmpSuffix = ".pinsync-tmp"
-	oldSuffix = ".pinsync-old"
+	tmpSuffix     = ".pinsync-tmp"
+	oldSuffix     = ".pinsync-old"
+	partialSuffix = ".pinsync-partial"
 )
+
+// Siblings returns every path pull creates beside dest: the staging tree,
+// the previous tree held aside during a swap, and the files kept from a pull
+// that failed before its swap. Each is a directory pull owns outright; a
+// caller can keep its own paths clear of them or walk them.
+func Siblings(dest string) []string {
+	dest = filepath.Clean(dest)
+	return []string{dest + tmpSuffix, dest + oldSuffix, dest + partialSuffix}
+}
 
 // goos is a test seam for Windows-specific behavior.
 var goos = runtime.GOOS
@@ -106,8 +117,9 @@ func Pull(ctx context.Context, client S3API, bucket, prefix, dest string, opts O
 // PullWithManifest converges dest to exactly the manifest's tree and returns
 // the manifest bytes of the attempt that installed it; the manifest is never
 // refetched after replacement. A staged object that mismatches its manifest
-// entry re-fetches the manifest and retries the whole sync; any other error,
-// including any error from BeforeReplace or the swap, is returned at once.
+// entry re-fetches the manifest and retries the whole sync, reusing whatever
+// the abandoned attempt already staged; any other error, including any error
+// from BeforeReplace or the swap, is returned at once.
 func PullWithManifest(ctx context.Context, client S3API, bucket, prefix, dest string, opts Options) (Result, error) {
 	s, err := newSyncer(dest, opts)
 	if err != nil {
@@ -116,7 +128,7 @@ func PullWithManifest(ctx context.Context, client S3API, bucket, prefix, dest st
 	s.client, s.bucket, s.prefix = client, bucket, strings.TrimSuffix(prefix, "/")
 	s.fetch = s.download
 
-	if err := recoverInterrupted(s.dest, s.tmp, s.old, s.logger); err != nil {
+	if err := recoverInterrupted(s.dest, s.tmp, s.old, s.partial, s.logger); err != nil {
 		return Result{}, err
 	}
 
@@ -154,6 +166,7 @@ type syncer struct {
 	bucket, prefix string
 	source         string // ReplaceFromDirectory's source tree
 	dest, tmp, old string
+	partial        string // files kept from a pull that failed before its swap
 	parallel       int
 	logger         *slog.Logger
 	swapAttempts   int
@@ -198,7 +211,7 @@ func newSyncer(dest string, opts Options) (*syncer, error) {
 	if s.maxContent == 0 {
 		s.maxContent = DefaultMaxContentBytes
 	}
-	s.tmp, s.old = s.dest+tmpSuffix, s.dest+oldSuffix
+	s.tmp, s.old, s.partial = s.dest+tmpSuffix, s.dest+oldSuffix, s.dest+partialSuffix
 	return s, nil
 }
 
@@ -214,8 +227,9 @@ func (s *syncer) syncOnce(ctx context.Context) (Result, *stagedMismatchError, er
 
 // replace runs one hash → stage → verify → BeforeReplace → swap cycle for the
 // manifest m encoded as raw, which the caller owns. On any error before the
-// swap the staging tree is discarded and dest is untouched. mismatch is
-// non-nil only when staging failed on a staged-content mismatch — the one
+// swap dest is untouched and the staging tree is kept as the partial tree
+// (see keepStaged). mismatch is non-nil only when staging failed on a
+// staged-content mismatch and the staging tree was cleared — the one
 // retryable failure; errors from BeforeReplace and the swap never set it,
 // whatever they wrap.
 func (s *syncer) replace(ctx context.Context, raw []byte, m *manifest.Manifest) (Result, *stagedMismatchError, error) {
@@ -227,12 +241,13 @@ func (s *syncer) replace(ctx context.Context, raw []byte, m *manifest.Manifest) 
 		return Result{}, nil, err
 	}
 	var mismatch *stagedMismatchError
-	stats, err := s.stage(ctx, m, live)
+	stats, err := s.stage(ctx, m, live, s.hashPartial())
 	if err != nil {
 		errors.As(err, &mismatch)
 	} else {
 		// Re-read the whole staged tree: linked and copied entries were
-		// trusted from the live hash, which may have changed since.
+		// trusted from the live or partial hash, which may have changed
+		// since.
 		// CEILING: this reads every staged byte a second time, including
 		// fresh downloads already hashed while streaming. Fine for config
 		// trees; if pull time on large trees matters, re-verify only the
@@ -246,13 +261,34 @@ func (s *syncer) replace(ctx context.Context, raw []byte, m *manifest.Manifest) 
 		err = s.swap()
 	}
 	if err != nil {
-		_ = os.RemoveAll(s.tmp)
+		// A staging tree that can be neither kept nor deleted rules out a
+		// retry, which would have to stage over it; the next pull's recovery
+		// tries again.
+		if keepErr := keepStaged(s.tmp, s.partial, s.logger); keepErr != nil {
+			return Result{}, nil, errors.Join(err, keepErr)
+		}
 		return Result{}, mismatch, err
 	}
 	stats.Total = len(m.Files)
-	s.logger.Info("pull complete", "total", stats.Total,
-		"downloaded", stats.Downloaded, "linked", stats.Linked, "copied", stats.Copied)
+	s.logger.Info("pull complete", "total", stats.Total, "downloaded", stats.Downloaded,
+		"linked", stats.Linked, "copied", stats.Copied, "reused", stats.Reused)
 	return Result{Stats: stats, Manifest: raw}, nil, nil
+}
+
+// hashPartial indexes the partial tree by content. The partial tree only
+// saves downloads, so one that cannot be read is logged and treated as empty;
+// either way staging removes it once nothing more can come from it.
+// CEILING: this reads every partial byte, including files that were linked
+// from the live tree and so were just hashed there. Bounded by one manifest's
+// content and far cheaper than downloading; if it matters, skip inodes that
+// are already in the live tree.
+func (s *syncer) hashPartial() map[contentKey]leftover {
+	files, err := hashTree(s.partial)
+	if err != nil {
+		s.logger.Warn("ignoring unreadable files kept from a failed pull", "path", s.partial, "error", err)
+		return nil
+	}
+	return byContent(files)
 }
 
 // checkContentSize rejects a manifest whose total declared size exceeds the

@@ -9,20 +9,24 @@ import (
 // Plan is the read-only preview DryRun returns: what Pull would do without
 // touching the live tree. Download, Copy, and Remove are sorted lexically;
 // Linked counts the entries that already match (content and mode) and would be
-// staged as a hardlink; Total is the manifest entry count.
+// staged as a hardlink; Total is the manifest entry count. Download lists every
+// entry whose content changes, including the Reused ones that the partial tree
+// kept from a failed pull would supply without a GET; Stats.Downloaded, unlike
+// Download, leaves those out.
 type Plan struct {
 	Download, Copy, Remove []string
-	Linked, Total          int
+	Linked, Reused, Total  int
 }
 
 // DryRun previews what Pull would converge dest to, without writing anything:
-// it fetches the manifest once, re-hashes the live tree, and classifies every
-// entry with the same decision real staging uses (download / copy / hardlink),
-// plus the live paths absent from the manifest that Pull would remove at swap.
-// It performs at most one GetObject (the manifest — never content), creates no
-// staging tree, and skips crash recovery: leftover state from an interrupted
-// pull is reported as a warning rather than repaired, so the preview may be
-// inaccurate until the next real pull recovers.
+// it fetches the manifest once, re-hashes the live tree and any partial tree,
+// and classifies every entry with the same decision real staging uses
+// (download / reuse / copy / hardlink), plus the live paths absent from the
+// manifest that Pull would remove at swap. It performs at most one GetObject
+// (the manifest — never content), creates or changes no sibling tree, and
+// skips crash recovery: leftover state from an interrupted pull is reported as
+// a warning rather than repaired, so the preview may be inaccurate until the
+// next real pull recovers.
 func DryRun(ctx context.Context, client S3API, bucket, prefix, dest string, opts Options) (Plan, error) {
 	s, err := newSyncer(dest, opts)
 	if err != nil {
@@ -47,18 +51,22 @@ func DryRun(ctx context.Context, client S3API, bucket, prefix, dest string, opts
 	if err != nil {
 		return Plan{}, err
 	}
+	partial := s.hashPartial()
 
 	var plan Plan
 	inManifest := make(map[string]struct{}, len(m.Files))
 	for _, f := range m.Files {
 		inManifest[f.Path] = struct{}{}
-		act, _, err := classify(f, live)
+		act, _, err := classify(f, live, partial)
 		if err != nil {
 			return Plan{}, err
 		}
 		switch act {
 		case actDownload:
 			plan.Download = append(plan.Download, f.Path)
+		case actReuse:
+			plan.Download = append(plan.Download, f.Path)
+			plan.Reused++
 		case actCopy:
 			plan.Copy = append(plan.Copy, f.Path)
 		case actLink:

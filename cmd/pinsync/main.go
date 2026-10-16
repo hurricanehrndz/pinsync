@@ -315,8 +315,13 @@ func execute(ctx context.Context, c *cli, client *s3.Client, logger *slog.Logger
 	if err != nil {
 		return "", err
 	}
-	return fmt.Sprintf("pulled %d files: %d downloaded, %d linked, %d copied",
-		stats.Total, stats.Downloaded, stats.Linked, stats.Copied), nil
+	return pullReport(stats), nil
+}
+
+// pullReport renders a pull's one-line summary; its counts add up to the total.
+func pullReport(stats pull.Stats) string {
+	return fmt.Sprintf("pulled %d files: %d downloaded, %d reused, %d linked, %d copied",
+		stats.Total, stats.Downloaded, stats.Reused, stats.Linked, stats.Copied)
 }
 
 // executePush runs a push, an adopt, or a read-only dry-run preview and renders
