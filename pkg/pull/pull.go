@@ -5,7 +5,8 @@
 // copy mode-changed / download changed), re-verifies that tree against the
 // manifest, and atomically swaps it in. On any failure before the swap the
 // destination is left byte-for-byte untouched, and the files staged so far
-// are kept beside it so the next run downloads only what is still missing.
+// are kept beside it so the next run downloads only what is still missing,
+// resuming a large download cut off partway.
 //
 // PullWithManifest also returns the exact manifest bytes it installed, and
 // Options.BeforeReplace lets a caller persist them before the swap.
@@ -21,7 +22,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"io/fs"
 	"log/slog"
 	"path"
 	"path/filepath"
@@ -76,6 +76,7 @@ type Stats struct {
 	Linked     int // hardlink into the live tree's file
 	Copied     int // copied locally (mode change or hardlink fallback)
 	Reused     int // staged from a failed pull's leftover files instead of downloaded
+	Resumed    int // of Downloaded, those completed from a download a failed pull cut off
 	Total      int // manifest entries
 }
 
@@ -175,8 +176,9 @@ type syncer struct {
 	maxManifest    int64
 	maxContent     int64
 
-	// fetch stages one entry's bytes from the source (S3 or a directory).
-	fetch func(ctx context.Context, f manifest.File, dst string, mode fs.FileMode) error
+	// fetch stages one entry's bytes from the source (S3 or a directory) and
+	// reports whether it resumed a cut-off download.
+	fetch func(ctx context.Context, j job, dst string) (resumed bool, err error)
 }
 
 // newSyncer validates opts and applies the defaults shared by every entry
@@ -236,7 +238,7 @@ func (s *syncer) replace(ctx context.Context, raw []byte, m *manifest.Manifest) 
 	if err := s.checkContentSize(m); err != nil {
 		return Result{}, nil, err
 	}
-	live, err := hashTree(s.dest)
+	live, err := hashTree(s.dest, "")
 	if err != nil {
 		return Result{}, nil, err
 	}
@@ -271,11 +273,12 @@ func (s *syncer) replace(ctx context.Context, raw []byte, m *manifest.Manifest) 
 	}
 	stats.Total = len(m.Files)
 	s.logger.Info("pull complete", "total", stats.Total, "downloaded", stats.Downloaded,
-		"linked", stats.Linked, "copied", stats.Copied, "reused", stats.Reused)
+		"linked", stats.Linked, "copied", stats.Copied, "reused", stats.Reused, "resumed", stats.Resumed)
 	return Result{Stats: stats, Manifest: raw}, nil, nil
 }
 
-// hashPartial indexes the partial tree by content. The partial tree only
+// hashPartial indexes the partial tree by content, leaving out the prefixes
+// of cut-off downloads (see resumeDir), which match no entry. The partial tree only
 // saves downloads, so one that cannot be read is logged and treated as empty;
 // either way staging removes it once nothing more can come from it.
 // CEILING: this reads every partial byte, including files that were linked
@@ -283,7 +286,7 @@ func (s *syncer) replace(ctx context.Context, raw []byte, m *manifest.Manifest) 
 // content and far cheaper than downloading; if it matters, skip inodes that
 // are already in the live tree.
 func (s *syncer) hashPartial() map[contentKey]leftover {
-	files, err := hashTree(s.partial)
+	files, err := hashTree(s.partial, resumeDir)
 	if err != nil {
 		s.logger.Warn("ignoring unreadable files kept from a failed pull", "path", s.partial, "error", err)
 		return nil

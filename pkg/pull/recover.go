@@ -13,8 +13,9 @@ import (
 // Afterwards dest is either the tree from before the interrupted replacement
 // or the fully swapped-in new one (a crash after both renames), and only the
 // partial tree may remain beside it: a leftover staging tree is kept there
-// for the next pull to reuse by content. It never promotes the unverified
-// staging tree. Pull, PullWithManifest, and ReplaceFromDirectory run it first
+// for the next pull to reuse by content, with any download it cut off
+// partway for the next pull to resume (see resumeDir). It never promotes the
+// unverified staging tree. Pull, PullWithManifest, and ReplaceFromDirectory run it first
 // themselves.
 func Recover(ctx context.Context, dest string, logger *slog.Logger) error {
 	if err := ctx.Err(); err != nil {
@@ -34,7 +35,9 @@ func Recover(ctx context.Context, dest string, logger *slog.Logger) error {
 // converges to the same end state as rolling forward, without ever trusting
 // an unverified leftover staging tree. Either way a leftover staging tree is
 // kept as the partial tree (see keepStaged): never promoted, only re-hashed
-// and reused by content.
+// and reused by content, its cut-off downloads continued only when the
+// object still has the ETag they were fetched with and the result hashes
+// right.
 func recoverInterrupted(dest, tmp, old, partial string, logger *slog.Logger) error {
 	switch {
 	case !exists(old): // nothing to roll back or clean up
@@ -54,7 +57,9 @@ func recoverInterrupted(dest, tmp, old, partial string, logger *slog.Logger) err
 
 // keepStaged keeps a staging tree that never reached its swap as the partial
 // tree, so a later pull can reuse its files instead of downloading them
-// again. If the partial tree still exists, staging either never got past
+// again and resume the downloads in its resume directory. A kill can leave
+// that directory mid-write; downloadResumable only trusts what it re-hashes.
+// If the partial tree still exists, staging either never got past
 // reusing it (stage removes it before the first download) or could not
 // remove it; tmp is deleted instead, never merged into it, costing at most
 // the downloads since. A tmp that cannot be renamed is deleted too; the error

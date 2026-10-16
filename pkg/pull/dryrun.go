@@ -4,6 +4,8 @@ import (
 	"context"
 	"slices"
 	"strings"
+
+	"github.com/hurricanehrndz/pinsync/pkg/manifest"
 )
 
 // Plan is the read-only preview DryRun returns: what Pull would do without
@@ -12,10 +14,12 @@ import (
 // staged as a hardlink; Total is the manifest entry count. Download lists every
 // entry whose content changes, including the Reused ones that the partial tree
 // kept from a failed pull would supply without a GET; Stats.Downloaded, unlike
-// Download, leaves those out.
+// Download, leaves those out. Resumed counts the downloads a kept prefix of
+// a cut-off download would shorten; whether it really continues the object
+// is known only once the rest arrives.
 type Plan struct {
-	Download, Copy, Remove []string
-	Linked, Reused, Total  int
+	Download, Copy, Remove         []string
+	Linked, Reused, Resumed, Total int
 }
 
 // DryRun previews what Pull would converge dest to, without writing anything:
@@ -47,13 +51,14 @@ func DryRun(ctx context.Context, client S3API, bucket, prefix, dest string, opts
 		return Plan{}, err
 	}
 	// A missing dest yields an empty live map (first pull); hashTree handles it.
-	live, err := hashTree(s.dest)
+	live, err := hashTree(s.dest, "")
 	if err != nil {
 		return Plan{}, err
 	}
 	partial := s.hashPartial()
 
-	var plan Plan
+	plan := Plan{Total: len(m.Files)}
+	resumable := resumeSlots(m)
 	inManifest := make(map[string]struct{}, len(m.Files))
 	for _, f := range m.Files {
 		inManifest[f.Path] = struct{}{}
@@ -64,6 +69,9 @@ func DryRun(ctx context.Context, client S3API, bucket, prefix, dest string, opts
 		switch act {
 		case actDownload:
 			plan.Download = append(plan.Download, f.Path)
+			if s.wouldResume(f, resumable) {
+				plan.Resumed++
+			}
 		case actReuse:
 			plan.Download = append(plan.Download, f.Path)
 			plan.Reused++
@@ -81,6 +89,15 @@ func DryRun(ctx context.Context, client S3API, bucket, prefix, dest string, opts
 	slices.Sort(plan.Download)
 	slices.Sort(plan.Copy)
 	slices.Sort(plan.Remove)
-	plan.Total = len(m.Files)
 	return plan, nil
+}
+
+// wouldResume reports whether f, an entry to download, has a kept prefix the
+// next pull would try to continue. It only reads the partial tree.
+func (s *syncer) wouldResume(f manifest.File, resumable func(manifest.File) bool) bool {
+	if !resumable(f) {
+		return false
+	}
+	_, _, ok := prefixFilesIn(s.partial, f.SHA256).inspect(f)
+	return ok
 }

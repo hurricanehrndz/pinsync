@@ -212,10 +212,11 @@ func TestDryRunReport(t *testing.T) {
 }
 
 // TestPullReport checks that the pull summary accounts for every entry,
-// including those reused from a failed pull.
+// including those reused from a failed pull, and shows how many downloads
+// resumed from a kept prefix.
 func TestPullReport(t *testing.T) {
-	got := pullReport(pull.Stats{Downloaded: 1, Reused: 2, Linked: 3, Copied: 4, Total: 10})
-	if want := "pulled 10 files: 1 downloaded, 2 reused, 3 linked, 4 copied"; got != want {
+	got := pullReport(pull.Stats{Downloaded: 2, Resumed: 1, Reused: 2, Linked: 3, Copied: 3, Total: 10})
+	if want := "pulled 10 files: 2 downloaded (1 resumed), 2 reused, 3 linked, 3 copied"; got != want {
 		t.Errorf("pullReport = %q, want %q", got, want)
 	}
 }

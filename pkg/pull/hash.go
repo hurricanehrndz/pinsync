@@ -20,8 +20,9 @@ type localFile struct {
 // no hash cache, no mtime fast-path; content integrity can only be
 // established by reading the bytes. A missing root yields an empty map
 // (first pull). Non-regular entries are skipped, not errors: they cannot
-// serve as link/copy sources and simply vanish at swap.
-func hashTree(root string) (map[string]localFile, error) {
+// serve as link/copy sources and simply vanish at swap. A top-level
+// directory named skip, if not "", is left out.
+func hashTree(root, skip string) (map[string]localFile, error) {
 	files := map[string]localFile{}
 	err := filepath.WalkDir(root, func(p string, d fs.DirEntry, err error) error {
 		if err != nil {
@@ -29,6 +30,9 @@ func hashTree(root string) (map[string]localFile, error) {
 				return fs.SkipAll
 			}
 			return err
+		}
+		if d.IsDir() && skip != "" && p == filepath.Join(root, skip) {
+			return fs.SkipDir
 		}
 		if d.IsDir() || !d.Type().IsRegular() {
 			return nil
