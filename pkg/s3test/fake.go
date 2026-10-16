@@ -7,11 +7,15 @@ package s3test
 import (
 	"bytes"
 	"context"
+	"crypto/md5" //nolint:gosec // S3's single-part ETag is an MD5; not a security use
 	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
 	"fmt"
 	"io"
+	"net/http"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -20,6 +24,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"github.com/aws/smithy-go"
+	smithyhttp "github.com/aws/smithy-go/transport/http"
 )
 
 // Fake is an in-memory S3 store implementing the PutObject, GetObject and
@@ -29,6 +34,7 @@ type Fake struct {
 	objects     map[string][]byte
 	mod         map[string]time.Time
 	sums        map[string]string // base64 SHA256, only for SHA256-checksummed puts
+	etags       map[string]string // SetETag overrides; the default is the body's MD5
 	putAlgo     map[string]types.ChecksumAlgorithm
 	putSum      map[string]string // ChecksumSHA256 supplied by the caller, "" if none
 	getMode     map[string]types.ChecksumMode
@@ -50,6 +56,7 @@ type Fake struct {
 	HeadErr      func(key string) error               // non-nil return fails that head
 	HeadChecksum func(key, sum string) string         // transform the ChecksumSHA256 a head returns
 	HeadDelay    time.Duration                        // hold each head open, for concurrency tests
+	IgnoreRange  bool                                 // answer ranged GETs with the whole object and no Content-Range
 }
 
 // NewFake returns an empty in-memory store.
@@ -58,6 +65,7 @@ func NewFake() *Fake {
 		objects:  map[string][]byte{},
 		mod:      map[string]time.Time{},
 		sums:     map[string]string{},
+		etags:    map[string]string{},
 		putAlgo:  map[string]types.ChecksumAlgorithm{},
 		putSum:   map[string]string{},
 		getMode:  map[string]types.ChecksumMode{},
@@ -108,6 +116,7 @@ func (f *Fake) PutObject(ctx context.Context, in *s3.PutObjectInput, _ ...func(*
 
 	f.mu.Lock()
 	f.objects[key] = body
+	delete(f.etags, key)
 	f.putAlgo[key] = in.ChecksumAlgorithm
 	f.putSum[key] = aws.ToString(in.ChecksumSHA256)
 	if in.ChecksumAlgorithm == types.ChecksumAlgorithmSha256 {
@@ -187,6 +196,12 @@ func sleep(ctx context.Context, d time.Duration) error {
 }
 
 // GetObject serves the stored body, recording call order and checksum mode.
+// Like S3 it returns an ETag (the body's MD5 unless SetETag overrides it),
+// fails a stale IfMatch with 412 PreconditionFailed, and serves a
+// "bytes=N-" or "bytes=N-M" Range with a Content-Range, or 416 InvalidRange
+// when N is past the end; errors carry the HTTP status as the SDK's do.
+// IgnoreRange serves the whole object instead, as a server without range
+// support does. GetBody transforms the whole body before any range is cut.
 func (f *Fake) GetObject(_ context.Context, in *s3.GetObjectInput, _ ...func(*s3.Options)) (*s3.GetObjectOutput, error) {
 	key := aws.ToString(in.Key)
 	if f.BeforeGet != nil {
@@ -196,17 +211,80 @@ func (f *Fake) GetObject(_ context.Context, in *s3.GetObjectInput, _ ...func(*s3
 	f.getOrder = append(f.getOrder, key)
 	f.getMode[key] = in.ChecksumMode
 	body, ok := f.objects[key]
+	etag := f.etagLocked(key)
+	ignoreRange := f.IgnoreRange
 	f.mu.Unlock()
 	if !ok {
 		return nil, &types.NoSuchKey{}
 	}
+	if m := aws.ToString(in.IfMatch); m != "" && m != etag {
+		return nil, httpError(http.StatusPreconditionFailed, "PreconditionFailed",
+			"At least one of the pre-conditions you specified did not hold")
+	}
 	if f.GetBody != nil {
 		body = f.GetBody(key, body)
 	}
-	return &s3.GetObjectOutput{
-		Body:          io.NopCloser(bytes.NewReader(body)),
-		ContentLength: aws.Int64(int64(len(body))),
-	}, nil
+	out := &s3.GetObjectOutput{ETag: aws.String(etag), AcceptRanges: aws.String("bytes")}
+	if start, end, ok := parseRange(aws.ToString(in.Range)); ok && !ignoreRange {
+		if start >= int64(len(body)) {
+			return nil, httpError(http.StatusRequestedRangeNotSatisfiable, "InvalidRange",
+				"The requested range is not satisfiable")
+		}
+		end = min(end, int64(len(body))-1)
+		out.ContentRange = aws.String(fmt.Sprintf("bytes %d-%d/%d", start, end, len(body)))
+		body = body[start : end+1]
+	}
+	out.Body = io.NopCloser(bytes.NewReader(body))
+	out.ContentLength = aws.Int64(int64(len(body)))
+	return out, nil
+}
+
+// parseRange reads a single "bytes=N-" or "bytes=N-M" range; anything else is
+// ignored, as HTTP servers ignore a Range they cannot parse.
+func parseRange(h string) (start, end int64, ok bool) {
+	spec, found := strings.CutPrefix(h, "bytes=")
+	from, to, dash := strings.Cut(spec, "-")
+	if !found || !dash {
+		return 0, 0, false
+	}
+	start, err := strconv.ParseInt(from, 10, 64)
+	if err != nil || start < 0 {
+		return 0, 0, false
+	}
+	if to == "" {
+		return start, 1<<62 - 1, true
+	}
+	end, err = strconv.ParseInt(to, 10, 64)
+	if err != nil || end < start {
+		return 0, 0, false
+	}
+	return start, end, true
+}
+
+// httpError builds an error shaped like the SDK's for an S3 error response:
+// an API error code wrapped in a response error that reports the status.
+func httpError(status int, code, msg string) error {
+	return &smithyhttp.ResponseError{
+		Response: &smithyhttp.Response{Response: &http.Response{StatusCode: status}},
+		Err:      &smithy.GenericAPIError{Code: code, Message: msg},
+	}
+}
+
+// etagLocked returns key's ETag; f.mu must be held.
+func (f *Fake) etagLocked(key string) string {
+	if e, ok := f.etags[key]; ok {
+		return e
+	}
+	sum := md5.Sum(f.objects[key]) //nolint:gosec // see the import
+	return `"` + hex.EncodeToString(sum[:]) + `"`
+}
+
+// SetETag makes key report etag until its next put or Store, standing for a
+// re-upload that changes the ETag but not the bytes (multipart, SSE-KMS).
+func (f *Fake) SetETag(key, etag string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.etags[key] = etag
 }
 
 // Store seeds or overwrites an object directly, bypassing the hooks. Like an
@@ -216,6 +294,7 @@ func (f *Fake) Store(key string, body []byte) {
 	defer f.mu.Unlock()
 	f.objects[key] = append([]byte(nil), body...)
 	delete(f.sums, key)
+	delete(f.etags, key)
 }
 
 // StoreAt seeds or overwrites an object with a LastModified time, so listing
@@ -227,6 +306,7 @@ func (f *Fake) StoreAt(key string, body []byte, mod time.Time) {
 	f.objects[key] = append([]byte(nil), body...)
 	f.mod[key] = mod
 	delete(f.sums, key)
+	delete(f.etags, key)
 }
 
 // Delete removes an object directly.
@@ -236,6 +316,7 @@ func (f *Fake) Delete(key string) {
 	delete(f.objects, key)
 	delete(f.mod, key)
 	delete(f.sums, key)
+	delete(f.etags, key)
 }
 
 // ListObjectsV2 lists stored keys under the requested Prefix in lexical order,
@@ -306,6 +387,7 @@ func (f *Fake) DeleteObjects(_ context.Context, in *s3.DeleteObjectsInput, _ ...
 		delete(f.objects, key)
 		delete(f.mod, key)
 		delete(f.sums, key)
+		delete(f.etags, key)
 		f.delOrder = append(f.delOrder, key)
 		if !quiet {
 			out.Deleted = append(out.Deleted, types.DeletedObject{Key: aws.String(key)})
