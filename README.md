@@ -94,6 +94,16 @@ so the next pull removes it.
 The manifest can live elsewhere with `-manifest-key`. See
 [Layout](https://github.com/hurricanehrndz/pinsync/wiki/Layout).
 
+## Usage
+
+`pinsync help` lists the commands. `pinsync push -h`, or `pinsync help push`,
+prints that command's synopsis and flags.
+
+Flags go before the directory. Go's flag parser stops at the first argument
+that isn't a flag, so `pinsync push ./config-tree -bucket my-bucket` fails and
+names the misplaced flag. A directory whose name starts with `-` goes after
+`--`.
+
 ## Push
 
 ```sh

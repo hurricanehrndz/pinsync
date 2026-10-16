@@ -24,13 +24,50 @@ import (
 	"github.com/hurricanehrndz/pinsync/pkg/rolesanywhere"
 )
 
-const usage = `usage:
-  pinsync push    -bucket B [flags] <root>   publish root to s3://B/<prefix>
-  pinsync pull    -bucket B [flags] <dest>   mirror s3://B/<prefix> into dest
-  pinsync prune   -bucket B [flags]          delete unreferenced objects under s3://B/<prefix>
-  pinsync version                        print the pinsync version and exit
+// subcommands drives both the top-level usage and each subcommand's -h, so
+// the two cannot drift. arg is the positional argument, empty for none.
+var subcommands = []struct{ name, arg, summary string }{
+	{"push", "<root>", "publish root to s3://B/<prefix>"},
+	{"pull", "<dest>", "mirror s3://B/<prefix> into dest"},
+	{"prune", "", "delete unreferenced objects under s3://B/<prefix>"},
+}
 
-run "pinsync push -h", "pinsync pull -h", or "pinsync prune -h" for flags`
+// synopsis is the one-line invocation of a subcommand, e.g. "pinsync push -bucket B [flags] <root>".
+func synopsis(name, arg string) string {
+	return strings.TrimSpace("pinsync " + name + " -bucket B [flags] " + arg)
+}
+
+// usage is the top-level help, shown for -h/help and with a bad subcommand.
+var usage = func() string {
+	var b strings.Builder
+	b.WriteString("usage:\n")
+	for _, s := range subcommands {
+		fmt.Fprintf(&b, "  %-40s %s\n", synopsis(s.name, s.arg), s.summary)
+	}
+	fmt.Fprintf(&b, "  %-40s %s\n", "pinsync version", "print the pinsync version and exit")
+	b.WriteString("\nrun \"pinsync <command> -h\" for a command's flags")
+	return b.String()
+}()
+
+// subcommandUsage is fs.Usage for one subcommand. Go's flag package stops at
+// the first non-flag argument, so flags placed after the positional are read
+// as extra positionals; say so rather than leave it to the error.
+func subcommandUsage(fs *flag.FlagSet, name string) func() {
+	return func() {
+		for _, s := range subcommands {
+			if s.name != name {
+				continue
+			}
+			head := fmt.Sprintf("usage: %s\n\n%s\n\n", synopsis(s.name, s.arg), s.summary)
+			if s.arg != "" {
+				head += "flags must come before " + s.arg + "\n\n"
+			}
+			// Help output has nowhere to report a failed write.
+			_, _ = io.WriteString(fs.Output(), head+"flags:\n")
+			fs.PrintDefaults()
+		}
+	}
+}
 
 // version is the pinsync release version, managed by `go tool versionbump`
 // (see versionbump.yaml).
@@ -108,15 +145,14 @@ func parseArgs(args []string, stderr io.Writer) (*cli, error) {
 	}
 	fs := flag.NewFlagSet("pinsync "+c.sub, flag.ContinueOnError)
 	fs.SetOutput(stderr)
+	fs.Usage = subcommandUsage(fs, c.sub)
 	registerFlags(c, fs)
 	if err := fs.Parse(args[1:]); err != nil {
 		return nil, err
 	}
-	if c.bucket == "" {
-		return nil, errors.New("-bucket is required")
-	}
-	if err := parsePositional(c, fs); err != nil {
-		return nil, err
+	// fs.Parse already printed usage for its own errors; these checks did not.
+	if err := checkUsage(c, fs); err != nil {
+		return nil, fmt.Errorf("%w\nrun \"pinsync %s -h\" for usage", err, c.sub)
 	}
 	// -adopt publishes the manifest without diffing; -full forces a full content
 	// re-upload. Asking for both is contradictory.
@@ -135,6 +171,25 @@ func parseArgs(args []string, stderr io.Writer) (*cli, error) {
 		return nil, err
 	}
 	return c, nil
+}
+
+// checkUsage validates the command shape: no flag after the positional,
+// -bucket set, and the right positional count.
+func checkUsage(c *cli, fs *flag.FlagSet) error {
+	// Parse stops at the first positional, so a flag after it would surface as
+	// a confusing "-bucket is required" or extra-positional error. Args()[0]
+	// is skipped so "--" still lets a root start with a dash.
+	if rest := fs.Args(); len(rest) > 1 {
+		for _, a := range rest[1:] {
+			if len(a) > 1 && a[0] == '-' {
+				return fmt.Errorf("flag %s follows %q; flags must come before it", a, rest[0])
+			}
+		}
+	}
+	if c.bucket == "" {
+		return errors.New("-bucket is required")
+	}
+	return parsePositional(c, fs)
 }
 
 // parsePositional validates the positional arguments: prune takes none, while
@@ -253,9 +308,21 @@ func parseRAFlags(c *cli, fs *flag.FlagSet) error {
 }
 
 func run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
-	if len(args) > 0 && args[0] == "version" {
-		_, err := fmt.Fprintln(stdout, version)
-		return err
+	if len(args) > 0 {
+		switch args[0] {
+		case "version":
+			_, err := fmt.Fprintln(stdout, version)
+			return err
+		case "-h", "-help", "--help", "help":
+			// "help push" is "push -h".
+			if len(args) > 1 {
+				_, err := parseArgs([]string{args[1], "-h"}, stderr)
+				return err
+			}
+			// stderr, like the flag package's own -h output.
+			_, err := fmt.Fprintln(stderr, usage)
+			return err
+		}
 	}
 	c, err := parseArgs(args, stderr)
 	if err != nil {
