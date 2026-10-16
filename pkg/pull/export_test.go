@@ -24,3 +24,19 @@ func SetRenameFn(fn func(oldpath, newpath string) error) (restore func()) {
 	renameFn = fn
 	return func() { renameFn = orig }
 }
+
+// SetRemoveAllFn swaps the RemoveAll used on the staging and partial trees
+// and returns a restore func — lets black-box tests make a sibling tree
+// undeletable, as an open handle does on Windows.
+func SetRemoveAllFn(fn func(path string) error) (restore func()) {
+	orig := removeAllFn
+	removeAllFn = fn
+	return func() { removeAllFn = orig }
+}
+
+// SetGOOS makes pull behave as if it ran on goos and returns a restore func.
+func SetGOOS(name string) (restore func()) {
+	orig := goos
+	goos = name
+	return func() { goos = orig }
+}

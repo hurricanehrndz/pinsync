@@ -19,7 +19,7 @@ copy matches it.
 |---|---|---|
 | Deciding what changed | Size and modification time | SHA256 of the contents |
 | File permissions | Not stored | Recorded by push, applied by pull on Linux and macOS |
-| Interrupted download | Leaves a mix of old and new files | Destination untouched, and the next run recovers |
+| Interrupted download | Leaves a mix of old and new files | Destination untouched, and the next run reuses the files already downloaded |
 | Download during an upload | Can mix files from two uploads | Detects the mismatch and fetches the newer snapshot |
 | Local file corrupted, same size | Kept if its mtime is newer | Caught by the hash and downloaded again |
 | Stray local files | Stay unless you pass `--delete` | Gone after the next pull |
@@ -88,6 +88,13 @@ the new tree next to the destination, then renames it into place:
                          changed ones downloaded and hash-checked
 ```
 
+If the pull fails before the swap, from an error, a timeout or being killed,
+`/etc/myapp` stays as it was and the staged files move to
+`/etc/myapp.pinsync-partial/`. The next pull hashes them again, uses any whose
+bytes match a manifest entry, and downloads only the rest. A file cut off
+mid-download fails the hash and is fetched again in full. A successful pull
+removes the partial tree.
+
 Pull owns `/etc/myapp`. A file you drop in there by hand isn't in the manifest,
 so the next pull removes it.
 
@@ -131,7 +138,7 @@ pinsync pull -bucket my-bucket -prefix cfg/prod /etc/myapp
 ```
 
 ```
-pulled 3 files: 1 downloaded, 2 linked, 0 copied
+pulled 3 files: 1 downloaded, 0 reused, 2 linked, 0 copied
 ```
 
 Pull runs on Linux, macOS and Windows. A pull with nothing to do downloads
@@ -249,8 +256,11 @@ size) seen before `BeforeReplace`, by fetching the manifest again. Nothing is
 retried after the callback.
 
 - `pull.Recover(ctx, dest, logger)` finishes or rolls back an interrupted swap
-  using only `dest`, `dest.pinsync-tmp` and `dest.pinsync-old`. It never
-  promotes the unverified staging tree.
+  using only `dest` and its siblings. It never promotes the unverified staging
+  tree; it keeps it as `dest.pinsync-partial` for the next pull to reuse.
+- `pull.Siblings(dest)` lists every directory pull creates beside `dest`
+  (`.pinsync-tmp`, `.pinsync-old` and `.pinsync-partial`), for overlap checks
+  or permission repair.
 - `pull.ReplaceFromDirectory(ctx, source, dest, manifestBytes, opts)` installs
   the tree described by `manifestBytes` from a local directory, with the same
   verification, callback, swap and recovery. It only reads `source`.

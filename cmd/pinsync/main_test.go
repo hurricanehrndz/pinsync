@@ -213,6 +213,15 @@ func TestDryRunReport(t *testing.T) {
 	}
 }
 
+// TestPullReport checks that the pull summary accounts for every entry,
+// including those reused from a failed pull.
+func TestPullReport(t *testing.T) {
+	got := pullReport(pull.Stats{Downloaded: 1, Reused: 2, Linked: 3, Copied: 4, Total: 10})
+	if want := "pulled 10 files: 1 downloaded, 2 reused, 3 linked, 4 copied"; got != want {
+		t.Errorf("pullReport = %q, want %q", got, want)
+	}
+}
+
 // TestPullDryRunReport checks the multi-line pull preview: sorted
 // download/copy/remove lines followed by a count summary, and the "up to date"
 // fallback when the tree already matches the manifest.

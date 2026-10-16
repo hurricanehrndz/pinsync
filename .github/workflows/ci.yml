@@ -24,6 +24,19 @@ jobs:
       - run: go vet ./...
       # -tags integration compiles the whole suite, unit + RustFS-backed
       - run: go test -tags integration ./...
+  # Pull's sharing, hardlink and read-only rules only run for real here.
+  # Unit tests only: the integration suite needs RustFS, which nixpkgs does
+  # not build for Windows; see the test job for the pinned Linux build.
+  test-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+      - run: go build ./...
+      - run: go vet ./...
+      - run: go test ./...
   lint:
     runs-on: ubuntu-26.04
     steps:

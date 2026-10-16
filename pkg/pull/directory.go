@@ -13,7 +13,8 @@ import (
 // ReplaceFromDirectory converges dest to exactly the tree manifestBytes
 // describes, copying changed entries from the local source tree instead of
 // S3. Staging, verification, BeforeReplace, swap, and crash recovery are the
-// same as PullWithManifest; files in source that the manifest does not list
+// same as PullWithManifest, including keeping staged files after a failure
+// and reusing them by content; files in source that the manifest does not list
 // are ignored. source is only read: it is never renamed or deleted, its
 // files are copied rather than linked into dest, and it may not overlap dest
 // or its staging siblings.
@@ -40,15 +41,16 @@ func ReplaceFromDirectory(ctx context.Context, source, dest string, manifestByte
 	if !info.IsDir() {
 		return Result{}, fmt.Errorf("pull: source %s is not a directory", s.source)
 	}
-	// Checked before recovery, which may delete the staging siblings.
-	for _, p := range []string{s.dest, s.tmp, s.old} {
+	// Checked before recovery and staging, which may rename or delete the
+	// siblings.
+	for _, p := range append([]string{s.dest}, Siblings(s.dest)...) {
 		if within(s.source, p) || within(p, s.source) {
 			return Result{}, fmt.Errorf("pull: source %s overlaps %s", s.source, p)
 		}
 	}
 	s.fetch = s.copyFromSource
 
-	if err = recoverInterrupted(s.dest, s.tmp, s.old, s.logger); err != nil {
+	if err = recoverInterrupted(s.dest, s.tmp, s.old, s.partial, s.logger); err != nil {
 		return Result{}, err
 	}
 	res, _, err := s.replace(ctx, raw, m)
