@@ -12,6 +12,7 @@ import (
 	"path"
 	"path/filepath"
 	"slices"
+	"sync"
 	"sync/atomic"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -41,6 +42,8 @@ func (e *stagedMismatchError) Error() string {
 // counters aggregates per-entry outcomes across the staging workers.
 type counters struct {
 	downloaded, linked, copied, reused, resumed atomic.Int64
+	// leftovers holds the partial tree's paths already linked into s.tmp.
+	leftovers sync.Map
 }
 
 // job is one manifest entry and how stage reconciles it.
@@ -49,6 +52,8 @@ type job struct {
 	act  action
 	mode fs.FileMode
 	live fs.FileMode // the live file's mode, for actLink and actCopy
+	// inLive marks an actReuse whose content some live file has.
+	inLive bool
 
 	// resume lets an actDownload keep a prefix if cut off and continue a
 	// kept one (see resumeSlots).
@@ -68,6 +73,10 @@ func (s *syncer) stage(ctx context.Context, m *manifest.Manifest, live map[strin
 	partial map[contentKey]leftover,
 ) (Stats, error) {
 	resumable := resumeSlots(m)
+	liveContent := make(map[contentKey]bool, len(live))
+	for _, lf := range live {
+		liveContent[contentKey{lf.hash, lf.size}] = true
+	}
 	var local, remote []job
 	for _, f := range m.Files {
 		act, mode, err := classify(f, live, partial)
@@ -75,6 +84,7 @@ func (s *syncer) stage(ctx context.Context, m *manifest.Manifest, live map[strin
 			return Stats{}, err
 		}
 		j := job{f: f, act: act, mode: mode, live: live[f.Path].mode}
+		j.inLive = act == actReuse && liveContent[contentKey{f.SHA256, f.Size}]
 		if act == actDownload {
 			// Only S3 downloads resume; ReplaceFromDirectory copies locally.
 			j.resume = s.client != nil && resumable(f)
@@ -214,7 +224,14 @@ func (s *syncer) stageEntry(ctx context.Context, j job, partial map[contentKey]l
 	case actReuse:
 		lo := partial[contentKey{j.f.SHA256, j.f.Size}]
 		src := filepath.Join(s.partial, filepath.FromSlash(lo.path))
-		copyOnly := (goos != "windows" && lo.mode != j.mode) || readOnlyOnWindows(lo.mode)
+		// A leftover is linked into one entry and copied for any other with
+		// the same content. It is copied, too, when the live tree holds its
+		// content, since it may then be a live file a failed attempt linked
+		// and this attempt links again. So no two paths in dest share a file:
+		// a caller may reject a file with a second link, as osconfig-sync
+		// does on Windows.
+		_, taken := c.leftovers.LoadOrStore(lo.path, struct{}{})
+		copyOnly := taken || j.inLive || (goos != "windows" && lo.mode != j.mode) || readOnlyOnWindows(lo.mode)
 		if _, err := s.linkOrCopy(src, "partial", j, dst, copyOnly); err != nil {
 			return err
 		}

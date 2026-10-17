@@ -158,6 +158,59 @@ func TestPullMatchesLeftoversByContent(t *testing.T) {
 	}
 }
 
+// TestPullLinksALeftoverOnce: entries with the same content are staged from
+// one leftover, but only one of them is linked to it, so no two paths in
+// dest share a file, which a caller may reject.
+func TestPullLinksALeftoverOnce(t *testing.T) {
+	fake := s3test.NewFake()
+	files := map[string]string{"a.txt": "same", "b/a-copy.txt": "same", "c.txt": "charlie"}
+	pushFixture(t, fake, files)
+	dest := filepath.Join(t.TempDir(), "dest")
+	writeFile(t, partialDir(dest), "old.txt", "same", 0o644)
+
+	stats := mustPull(t, fake, dest)
+	if stats.Reused != 2 || stats.Downloaded != 1 {
+		t.Errorf("stats = %+v, want Reused=2 Downloaded=1", stats)
+	}
+	assertTree(t, dest, files)
+	assertNoPartial(t, dest)
+	if sameFile(t, filepath.Join(dest, "b", "a-copy.txt"), fileID(t, filepath.Join(dest, "a.txt"))) {
+		t.Error("a.txt and b/a-copy.txt are one file")
+	}
+}
+
+// TestPullNeverLinksALeftoverToALiveFile: a leftover may be a live file,
+// linked by an attempt that failed, or by a pull whose partial tree could
+// not be removed. Wherever it sits, it must not also be linked into another
+// entry with the same content.
+func TestPullNeverLinksALeftoverToALiveFile(t *testing.T) {
+	for name, leftover := range map[string]string{"same path": "a.txt", "other path": "old.txt"} {
+		t.Run(name, func(t *testing.T) {
+			fake := s3test.NewFake()
+			pushFixture(t, fake, map[string]string{"a.txt": "same"})
+			dest := filepath.Join(t.TempDir(), "dest")
+			mustPull(t, fake, dest)
+			if err := os.MkdirAll(partialDir(dest), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Link(filepath.Join(dest, "a.txt"), filepath.Join(partialDir(dest), leftover)); err != nil {
+				t.Fatal(err)
+			}
+			files := map[string]string{"a.txt": "same", "b.txt": "same"}
+			pushFixture(t, fake, files)
+
+			stats := mustPull(t, fake, dest)
+			if stats.Linked != 1 || stats.Reused != 1 || stats.Downloaded != 0 {
+				t.Errorf("stats = %+v, want Linked=1 Reused=1", stats)
+			}
+			assertTree(t, dest, files)
+			if sameFile(t, filepath.Join(dest, "b.txt"), fileID(t, filepath.Join(dest, "a.txt"))) {
+				t.Error("a.txt and b.txt are one file")
+			}
+		})
+	}
+}
+
 // TestPullFailureKeepsPartialUntilSuccess: a failed pull leaves dest exactly
 // as it was and keeps its staged files beside it; the pull that succeeds
 // fetches only what was missing and removes them.
