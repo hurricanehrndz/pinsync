@@ -1,6 +1,6 @@
 # The current version of the project. This is the source of truth for the project version. 
 # Set this once and let VersionBump manage it.
-version: "0.5.1"
+version: "0.5.2"
 # Git configuration (optional)
 git-commit: false # Whether to create a git commit for the version bump.
 git-sign: false # Whether to sign the git commit and tag.
