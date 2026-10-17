@@ -71,7 +71,7 @@ func subcommandUsage(fs *flag.FlagSet, name string) func() {
 
 // version is the pinsync release version, managed by `go tool versionbump`
 // (see versionbump.yaml).
-const version = "0.4.0"
+const version = "0.5.0"
 
 func main() {
 	err := run(context.Background(), os.Args[1:], os.Stdout, os.Stderr)
