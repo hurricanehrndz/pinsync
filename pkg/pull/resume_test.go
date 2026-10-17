@@ -675,8 +675,8 @@ func TestPullReservedResumeNameInManifest(t *testing.T) {
 
 // TestPullResumeNeverWritesThroughALink: a prefix is never written in place.
 // If its name is a hardlink to some other file (here, one outside the
-// trees), resuming copies the prefix forward into a fresh file and the other
-// file keeps its bytes.
+// trees, made after recovery, which would drop it), resuming copies the
+// prefix forward into a fresh file and the other file keeps its bytes.
 func TestPullResumeNeverWritesThroughALink(t *testing.T) {
 	fake := s3test.NewFake()
 	files, dest := resumeFixture(t, fake)
@@ -687,11 +687,12 @@ func TestPullResumeNeverWritesThroughALink(t *testing.T) {
 		t.Fatal(err)
 	}
 	control := filepath.Join(t.TempDir(), "control")
-	if err := os.Link(data, control); err != nil {
-		t.Skipf("hardlinks unavailable: %v", err)
-	}
+	c := &recordingClient{S3API: &afterRecovery{S3API: fake, fn: func() { mustLink(t, data, control) }}}
 
-	stats, _ := resumedPull(t, fake, dest)
+	stats, err := pull.Pull(context.Background(), c, "bkt", prefix, dest, pull.Options{Parallel: 1})
+	if err != nil {
+		t.Fatalf("Pull: %v", err)
+	}
 	if stats.Resumed != 1 {
 		t.Errorf("stats = %+v, want Resumed=1", stats)
 	}

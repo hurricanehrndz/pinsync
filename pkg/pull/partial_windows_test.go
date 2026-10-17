@@ -101,20 +101,15 @@ func TestPullHardlinksPartialOnNTFS(t *testing.T) {
 	pushFixture(t, fake, files)
 	dest := filepath.Join(t.TempDir(), "dest")
 	writeFile(t, partialDir(dest), "a.txt", "alpha", 0o644)
-	control := filepath.Join(filepath.Dir(dest), "control")
-	if err := os.Link(filepath.Join(partialDir(dest), "a.txt"), control); err != nil {
-		t.Fatal(err)
-	}
-	ctl, err := os.Stat(control)
-	if err != nil {
-		t.Fatal(err)
-	}
+	// A file ID, not a control hardlink: a second name would make recovery
+	// drop the leftover as possibly shared with the live tree.
+	leftover := fileID(t, filepath.Join(partialDir(dest), "a.txt"))
 
 	stats := mustPull(t, fake, dest)
 	if stats.Reused != 1 || stats.Downloaded != 0 {
 		t.Errorf("stats = %+v, want Reused=1", stats)
 	}
-	if !sameFile(t, filepath.Join(dest, "a.txt"), ctl) {
+	if !sameFile(t, filepath.Join(dest, "a.txt"), leftover) {
 		t.Error("leftover a.txt was copied, not linked")
 	}
 	assertTree(t, dest, files)
@@ -137,6 +132,27 @@ func storeManifest(t *testing.T, fake *s3test.Fake, files map[string]string, mod
 	}
 	fake.Store(manifestKey, buf.Bytes())
 	fake.ResetCalls()
+}
+
+// linkCount is p's number of names, the NumberOfLinks a consumer checks.
+func linkCount(t *testing.T, p string) uint64 {
+	t.Helper()
+	name, err := syscall.UTF16PtrFromString(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	h, err := syscall.CreateFile(name, 0,
+		syscall.FILE_SHARE_READ|syscall.FILE_SHARE_WRITE|syscall.FILE_SHARE_DELETE, nil,
+		syscall.OPEN_EXISTING, syscall.FILE_FLAG_BACKUP_SEMANTICS, 0)
+	if err != nil {
+		t.Fatalf("opening %s: %v", p, err)
+	}
+	defer func() { _ = syscall.CloseHandle(h) }()
+	var info syscall.ByHandleFileInformation
+	if err := syscall.GetFileInformationByHandle(h, &info); err != nil {
+		t.Fatal(err)
+	}
+	return uint64(info.NumberOfLinks)
 }
 
 func readOnly(t *testing.T, p string) bool {

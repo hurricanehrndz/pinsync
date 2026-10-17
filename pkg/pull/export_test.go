@@ -25,7 +25,7 @@ func SetRenameFn(fn func(oldpath, newpath string) error) (restore func()) {
 	return func() { renameFn = orig }
 }
 
-// SetRemoveAllFn swaps the RemoveAll used on the staging and partial trees
+// SetRemoveAllFn swaps the RemoveAll used on the staging, partial and old trees
 // and returns a restore func — lets black-box tests make a sibling tree
 // undeletable, as an open handle does on Windows.
 func SetRemoveAllFn(fn func(path string) error) (restore func()) {
@@ -34,8 +34,9 @@ func SetRemoveAllFn(fn func(path string) error) (restore func()) {
 	return func() { removeAllFn = orig }
 }
 
-// SetRemoveFn swaps the Remove used on kept prefixes and returns a restore
-// func — lets black-box tests make a prefix file undeletable.
+// SetRemoveFn swaps the Remove used on kept prefixes and on staged files the
+// live tree shares, and returns a restore func — lets black-box tests make
+// such a file undeletable.
 func SetRemoveFn(fn func(name string) error) (restore func()) {
 	orig := removeFn
 	removeFn = fn

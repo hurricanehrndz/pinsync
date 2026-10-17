@@ -109,9 +109,20 @@ func (s *syncer) stage(ctx context.Context, m *manifest.Manifest, live map[strin
 	s.adoptPrefixes(remote)
 	// A partial tree that cannot be removed costs only what it would save: if
 	// this attempt fails, keepStaged sees it still there and deletes s.tmp
-	// rather than mixing the two, and a later pull removes it.
+	// rather than mixing the two, and a later pull removes it. What is left
+	// of it must not share a file with s.tmp, which the swap makes live, so
+	// a name that can be neither removed with the tree nor dropped fails the
+	// pull while dest is still untouched (see unsharePartial). A partial file
+	// that stays undeletable, such as one held open without delete sharing on
+	// Windows, fails every pull here until it is released; that is deliberate,
+	// since a pull that succeeded would leave a live file with a second name.
+	// If that shows up in practice, stage reuse by copy instead of hardlink
+	// when the partial tree could not be removed.
 	if err := removeAllFn(s.partial); err != nil {
 		s.logger.Warn("could not remove files kept from a failed pull; continuing", "path", s.partial, "error", err)
+		if err := dropShared(s.partial); err != nil {
+			return Stats{}, fmt.Errorf("pull: %s may share files with the new tree and cannot be removed: %w", s.partial, err)
+		}
 	}
 	if err := s.stageAll(ctx, remote, partial, &c); err != nil {
 		return Stats{}, err

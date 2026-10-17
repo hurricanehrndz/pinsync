@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -179,10 +180,10 @@ func TestPullLinksALeftoverOnce(t *testing.T) {
 	}
 }
 
-// TestPullNeverLinksALeftoverToALiveFile: a leftover may be a live file,
-// linked by an attempt that failed, or by a pull whose partial tree could
-// not be removed. Wherever it sits, it must not also be linked into another
-// entry with the same content.
+// TestPullNeverLinksALeftoverToALiveFile: a leftover may be a live file.
+// Recovery drops such names (see TestFailedPullCleansOlderPartial), so this
+// one is made after it, standing in for one it missed. Wherever it sits, it
+// must not also be linked into another entry with the same content.
 func TestPullNeverLinksALeftoverToALiveFile(t *testing.T) {
 	for name, leftover := range map[string]string{"same path": "a.txt", "other path": "old.txt"} {
 		t.Run(name, func(t *testing.T) {
@@ -190,16 +191,16 @@ func TestPullNeverLinksALeftoverToALiveFile(t *testing.T) {
 			pushFixture(t, fake, map[string]string{"a.txt": "same"})
 			dest := filepath.Join(t.TempDir(), "dest")
 			mustPull(t, fake, dest)
-			if err := os.MkdirAll(partialDir(dest), 0o755); err != nil {
-				t.Fatal(err)
-			}
-			if err := os.Link(filepath.Join(dest, "a.txt"), filepath.Join(partialDir(dest), leftover)); err != nil {
-				t.Fatal(err)
-			}
 			files := map[string]string{"a.txt": "same", "b.txt": "same"}
 			pushFixture(t, fake, files)
+			client := &afterRecovery{S3API: fake, fn: func() {
+				mustLink(t, filepath.Join(dest, "a.txt"), filepath.Join(partialDir(dest), leftover))
+			}}
 
-			stats := mustPull(t, fake, dest)
+			stats, err := pull.Pull(context.Background(), client, "bkt", prefix, dest, pull.Options{})
+			if err != nil {
+				t.Fatalf("Pull: %v", err)
+			}
 			if stats.Linked != 1 || stats.Reused != 1 || stats.Downloaded != 0 {
 				t.Errorf("stats = %+v, want Linked=1 Reused=1", stats)
 			}
@@ -258,10 +259,7 @@ func TestPullReusedModeChangeCopies(t *testing.T) {
 	pushFixture(t, fake, files) // 0644
 	dest := filepath.Join(t.TempDir(), "dest")
 	writeFile(t, partialDir(dest), "a.txt", "alpha", 0o600)
-	control := filepath.Join(t.TempDir(), "control")
-	if err := os.Link(filepath.Join(partialDir(dest), "a.txt"), control); err != nil {
-		t.Fatal(err)
-	}
+	leftover := fileID(t, filepath.Join(partialDir(dest), "a.txt"))
 
 	stats := mustPull(t, fake, dest)
 	if stats.Reused != 1 || stats.Downloaded != 0 {
@@ -270,8 +268,8 @@ func TestPullReusedModeChangeCopies(t *testing.T) {
 	if mode := statMode(t, filepath.Join(dest, "a.txt")); mode != 0o644 {
 		t.Errorf("a.txt mode = %#o, want 0644", mode)
 	}
-	if mode := statMode(t, control); mode != 0o600 {
-		t.Errorf("leftover inode was chmodded: control mode = %#o, want 0600", mode)
+	if sameFile(t, filepath.Join(dest, "a.txt"), leftover) {
+		t.Error("leftover inode was linked and chmodded")
 	}
 }
 
@@ -451,6 +449,8 @@ func TestPullSurvivesUndeletablePartial(t *testing.T) {
 	}
 	assertTree(t, dest, files)
 	assertNoLeftovers(t, dest)
+	// The leftover it linked is live now, so its name in the stuck tree went.
+	assertNoLiveLinks(t, dest)
 
 	// Once it can be removed, the next pull does.
 	mustPull(t, fake, dest)
@@ -475,14 +475,8 @@ func TestPullNeverLinksReadOnlyFilesOnWindows(t *testing.T) {
 	}
 	before := fileID(t, liveA)
 	leftoverB := filepath.Join(partialDir(dest), "b.txt")
-	writeFile(t, partialDir(dest), "b.txt", "bravo", 0o644)
-	control := filepath.Join(t.TempDir(), "control")
-	if err := os.Link(leftoverB, control); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.Chmod(leftoverB, 0o444); err != nil {
-		t.Fatal(err)
-	}
+	writeFile(t, partialDir(dest), "b.txt", "bravo", 0o444)
+	leftover := fileID(t, leftoverB)
 	pushFixture(t, fake, map[string]string{"a.txt": "alpha", "b.txt": "bravo"})
 
 	stats := mustPull(t, fake, dest)
@@ -492,8 +486,8 @@ func TestPullNeverLinksReadOnlyFilesOnWindows(t *testing.T) {
 	if sameFile(t, liveA, before) {
 		t.Error("read-only live a.txt was linked into the new tree")
 	}
-	if ctl, err := os.Stat(control); err != nil || sameFile(t, filepath.Join(dest, "b.txt"), ctl) {
-		t.Errorf("read-only partial b.txt was linked into dest (stat err %v)", err)
+	if sameFile(t, filepath.Join(dest, "b.txt"), leftover) {
+		t.Error("read-only partial b.txt was linked into dest")
 	}
 }
 
@@ -606,5 +600,358 @@ func TestPullPartialIsRegularFile(t *testing.T) {
 	mustPull(t, fake, dest)
 	assertTree(t, dest, v2)
 	assertNoLeftovers(t, dest)
+	assertNoPartial(t, dest)
+}
+
+// regularFiles lists every regular file under root, none if it is missing.
+func regularFiles(t *testing.T, root string) []string {
+	t.Helper()
+	var files []string
+	err := filepath.WalkDir(root, func(p string, d fs.DirEntry, err error) error {
+		if p == root && errors.Is(err, fs.ErrNotExist) {
+			return fs.SkipAll
+		}
+		if err == nil && d.Type().IsRegular() {
+			files = append(files, p)
+		}
+		return err
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return files
+}
+
+// assertNoLiveLinks asserts no live file has a second name in the partial
+// tree, or anywhere: a caller may reject a live file with a second link, as
+// osconfig-sync does on Windows.
+func assertNoLiveLinks(t *testing.T, dest string) {
+	t.Helper()
+	kept := regularFiles(t, partialDir(dest))
+	for _, live := range regularFiles(t, dest) {
+		if n := linkCount(t, live); n != 1 {
+			t.Errorf("live %s has %d links, want 1", live, n)
+		}
+		id := fileID(t, live)
+		for _, p := range kept {
+			if sameFile(t, p, id) {
+				t.Errorf("partial %s is live %s", p, live)
+			}
+		}
+	}
+}
+
+// failBeforeReplace runs a pull that fails in BeforeReplace, after staging.
+func failBeforeReplace(t *testing.T, fake *s3test.Fake, dest string) {
+	t.Helper()
+	refused := errors.New("refused")
+	_, err := pull.Pull(context.Background(), fake, "bkt", prefix, dest, pull.Options{
+		BeforeReplace: func(context.Context, []byte) error { return refused },
+	})
+	if !errors.Is(err, refused) {
+		t.Fatalf("Pull = %v, want the BeforeReplace error", err)
+	}
+}
+
+// TestPullFailureKeepsNoLiveLinks: a pull that fails after staging keeps
+// what it downloaded, but not the live files it linked, which would give
+// each a second name until a pull succeeds. Linking them again costs
+// nothing.
+func TestPullFailureKeepsNoLiveLinks(t *testing.T) {
+	fake := s3test.NewFake()
+	v1 := map[string]string{"a.txt": "alpha", "sub/b.txt": "bravo"}
+	pushFixture(t, fake, v1)
+	dest := filepath.Join(t.TempDir(), "dest")
+	mustPull(t, fake, dest)
+	v2 := map[string]string{"a.txt": "alpha", "sub/b.txt": "bravo", "c.txt": "charlie"}
+	pushFixture(t, fake, v2)
+
+	failBeforeReplace(t, fake, dest)
+	assertTree(t, dest, v1)
+	assertNoLeftovers(t, dest)
+	assertNoLiveLinks(t, dest)
+	assertTree(t, partialDir(dest), map[string]string{"c.txt": "charlie", "sub": "<dir>"})
+
+	fake.ResetCalls()
+	stats := mustPull(t, fake, dest)
+	if got := contentGets(fake); len(got) != 0 {
+		t.Errorf("content GETs = %v, want none", got)
+	}
+	if stats.Linked != 2 || stats.Reused != 1 || stats.Downloaded != 0 {
+		t.Errorf("stats = %+v, want Linked=2 Reused=1", stats)
+	}
+	assertTree(t, dest, v2)
+	assertNoPartial(t, dest)
+}
+
+// TestRecoverKeepsNoLiveLinks: recovery after a kill has no record of what
+// the killed pull linked, and a staged file can share a live file at
+// another path (a leftover it reused) or in the resume directory. None is
+// kept; its own downloads and prefixes are.
+func TestRecoverKeepsNoLiveLinks(t *testing.T) {
+	dest := filepath.Join(t.TempDir(), "dest")
+	tmp := dest + ".pinsync-tmp"
+	live := map[string]string{"a.txt": "alpha", "sub/b.txt": "bravo"}
+	for rel, content := range live {
+		writeFile(t, dest, rel, content, 0o644)
+	}
+	prefixData := ".pinsync-resume/" + sha(bigContent(bigSize))
+	for from, to := range map[string]string{
+		"a.txt":     "a.txt",
+		"sub/b.txt": "moved.txt",
+	} {
+		if err := os.MkdirAll(filepath.Dir(filepath.Join(tmp, to)), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Link(filepath.Join(dest, from), filepath.Join(tmp, to)); err != nil {
+			t.Skipf("hardlinks unavailable: %v", err)
+		}
+	}
+	writeFile(t, tmp, prefixData, "cut", 0o644)
+	if err := os.Link(filepath.Join(dest, "a.txt"), resumeFile(tmp, "alpha", "")); err != nil {
+		t.Fatal(err)
+	}
+	writeFile(t, tmp, "c.txt", "charlie", 0o644)
+
+	if err := pull.Recover(context.Background(), dest, nil); err != nil {
+		t.Fatalf("Recover: %v", err)
+	}
+	assertTree(t, dest, live)
+	assertNoLeftovers(t, dest)
+	assertNoLiveLinks(t, dest)
+	assertTree(t, partialDir(dest), map[string]string{"c.txt": "charlie", prefixData: "cut"})
+}
+
+// TestPullDiscardsStagingWithAStuckLiveLink: a live file's staged name that
+// cannot be removed (on Windows, a consumer holding the file without delete
+// sharing) would be kept as a second name, so the staging tree is discarded
+// instead, and the live file is left alone.
+func TestPullDiscardsStagingWithAStuckLiveLink(t *testing.T) {
+	fake := s3test.NewFake()
+	v1 := map[string]string{"a.txt": "alpha"}
+	pushFixture(t, fake, v1)
+	dest := filepath.Join(t.TempDir(), "dest")
+	mustPull(t, fake, dest)
+	pushFixture(t, fake, map[string]string{"a.txt": "alpha", "b.txt": "bravo"})
+	stuck := filepath.Join(dest+".pinsync-tmp", "a.txt")
+	restore := pull.SetRemoveFn(func(p string) error {
+		if p == stuck {
+			return errors.New("held open")
+		}
+		return os.Remove(p)
+	})
+
+	failBeforeReplace(t, fake, dest)
+	restore()
+	assertTree(t, dest, v1)
+	assertNoLeftovers(t, dest)
+	assertNoPartial(t, dest)
+	assertNoLiveLinks(t, dest)
+}
+
+// TestRecoverDiscardsPrefixesWithAStuckLiveLink: the same holds in the
+// resume directory, whose prefixes are otherwise moved into a partial tree
+// even when the staging tree is discarded.
+func TestRecoverDiscardsPrefixesWithAStuckLiveLink(t *testing.T) {
+	dest := filepath.Join(t.TempDir(), "dest")
+	tmp := dest + ".pinsync-tmp"
+	writeFile(t, dest, "a.txt", "alpha", 0o644)
+	stuck := resumeFile(tmp, "alpha", "")
+	if err := os.MkdirAll(filepath.Dir(stuck), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Link(filepath.Join(dest, "a.txt"), stuck); err != nil {
+		t.Skipf("hardlinks unavailable: %v", err)
+	}
+	restore := pull.SetRemoveFn(func(p string) error {
+		if p == stuck {
+			return errors.New("held open")
+		}
+		return os.Remove(p)
+	})
+
+	err := pull.Recover(context.Background(), dest, nil)
+	restore()
+	if err != nil {
+		t.Fatalf("Recover: %v", err)
+	}
+	assertTree(t, dest, map[string]string{"a.txt": "alpha"})
+	assertNoLeftovers(t, dest)
+	assertNoPartial(t, dest)
+	assertNoLiveLinks(t, dest)
+}
+
+// afterRecovery runs fn when the pull fetches its manifest: after recovery,
+// which drops every partial name with a second link, and before staging.
+type afterRecovery struct {
+	pull.S3API
+	fn func()
+}
+
+func (c *afterRecovery) GetObject(ctx context.Context, in *s3.GetObjectInput, opts ...func(*s3.Options)) (*s3.GetObjectOutput, error) {
+	if aws.ToString(in.Key) == manifestKey && c.fn != nil {
+		c.fn()
+		c.fn = nil
+	}
+	return c.S3API.GetObject(ctx, in, opts...)
+}
+
+// mustLink gives from's file the second name to, skipping the test where
+// hardlinks are unavailable.
+func mustLink(t *testing.T, from, to string) {
+	t.Helper()
+	if err := os.MkdirAll(filepath.Dir(to), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Link(from, to); err != nil {
+		t.Skipf("hardlinks unavailable: %v", err)
+	}
+}
+
+// TestFailedPullCleansOlderPartial: v0.5.0 and v0.5.1 kept the live files a
+// failed pull linked, so their partial tree gives live files a second name,
+// with no staging tree beside it. A pull that fails before staging, here on
+// a missing manifest, still drops those names and keeps the rest.
+func TestFailedPullCleansOlderPartial(t *testing.T) {
+	dest := filepath.Join(t.TempDir(), "dest")
+	live := map[string]string{"a.txt": "alpha"}
+	writeFile(t, dest, "a.txt", "alpha", 0o644)
+	writeFile(t, partialDir(dest), "c.txt", "charlie", 0o644)
+	mustLink(t, filepath.Join(dest, "a.txt"), filepath.Join(partialDir(dest), "a.txt"))
+
+	if _, err := doPull(t, s3test.NewFake(), dest); err == nil {
+		t.Fatal("Pull without a manifest succeeded")
+	}
+	assertTree(t, dest, live)
+	assertNoLeftovers(t, dest)
+	assertNoLiveLinks(t, dest)
+	assertTree(t, partialDir(dest), map[string]string{"c.txt": "charlie"})
+}
+
+// TestRecoverCleansOlderPartialBesideStaging: with both an older partial
+// tree and a killed pull's staging tree, recovery drops the staging tree
+// first, so a leftover the killed pull linked into it has one name again
+// and is kept, while the partial tree's live links go.
+func TestRecoverCleansOlderPartialBesideStaging(t *testing.T) {
+	dest := filepath.Join(t.TempDir(), "dest")
+	tmp, partial := dest+".pinsync-tmp", partialDir(dest)
+	live := map[string]string{"a.txt": "alpha", "b.txt": "bravo"}
+	for rel, content := range live {
+		writeFile(t, dest, rel, content, 0o644)
+	}
+	mustLink(t, filepath.Join(dest, "a.txt"), filepath.Join(partial, "a.txt"))
+	writeFile(t, partial, "c.txt", "charlie", 0o644)
+	mustLink(t, filepath.Join(partial, "c.txt"), filepath.Join(tmp, "c.txt"))
+	mustLink(t, filepath.Join(dest, "b.txt"), filepath.Join(tmp, "b.txt"))
+
+	if err := pull.Recover(context.Background(), dest, nil); err != nil {
+		t.Fatalf("Recover: %v", err)
+	}
+	assertTree(t, dest, live)
+	assertNoLeftovers(t, dest)
+	assertNoLiveLinks(t, dest)
+	assertTree(t, partial, map[string]string{"c.txt": "charlie"})
+}
+
+// TestRecoverCleansOlderPartialBesideAStuckOld: a stale old tree that
+// cannot be removed fails recovery, but does not keep a partial tree's
+// second names of live files, such as one v0.5.0 or v0.5.1 left.
+func TestRecoverCleansOlderPartialBesideAStuckOld(t *testing.T) {
+	dest := filepath.Join(t.TempDir(), "dest")
+	old, partial := dest+".pinsync-old", partialDir(dest)
+	live := map[string]string{"a.txt": "alpha"}
+	writeFile(t, dest, "a.txt", "alpha", 0o644)
+	writeFile(t, old, "a.txt", "older", 0o644)
+	writeFile(t, partial, "c.txt", "charlie", 0o644)
+	mustLink(t, filepath.Join(dest, "a.txt"), filepath.Join(partial, "a.txt"))
+	restore := pull.SetRemoveAllFn(func(p string) error {
+		if p == old {
+			return errors.New("held open")
+		}
+		return os.RemoveAll(p)
+	})
+
+	err := pull.Recover(context.Background(), dest, nil)
+	restore()
+	if err == nil || !strings.Contains(err.Error(), old) {
+		t.Fatalf("Recover = %v, want the error removing %s", err, old)
+	}
+	assertTree(t, dest, live)
+	assertNoLiveLinks(t, dest)
+	assertTree(t, partial, map[string]string{"c.txt": "charlie"})
+}
+
+// TestRecoverFailsOnAStuckPartialLink: a live file's name in the partial
+// tree that cannot be removed costs the whole tree; if that cannot be
+// removed either, Recover fails rather than report a tree a caller may
+// reject.
+func TestRecoverFailsOnAStuckPartialLink(t *testing.T) {
+	dest := filepath.Join(t.TempDir(), "dest")
+	writeFile(t, dest, "a.txt", "alpha", 0o644)
+	writeFile(t, partialDir(dest), "c.txt", "charlie", 0o644)
+	stuck := filepath.Join(partialDir(dest), "a.txt")
+	mustLink(t, filepath.Join(dest, "a.txt"), stuck)
+	defer pull.SetRemoveFn(func(p string) error {
+		if p == stuck {
+			return errors.New("held open")
+		}
+		return os.Remove(p)
+	})()
+	restore := pull.SetRemoveAllFn(func(p string) error {
+		if p == partialDir(dest) {
+			return errors.New("held open")
+		}
+		return os.RemoveAll(p)
+	})
+
+	err := pull.Recover(context.Background(), dest, nil)
+	restore()
+	if err == nil {
+		t.Fatal("Recover left a live file with a second name and succeeded")
+	}
+	if err := pull.Recover(context.Background(), dest, nil); err != nil {
+		t.Fatalf("Recover with a removable partial tree: %v", err)
+	}
+	assertTree(t, dest, map[string]string{"a.txt": "alpha"})
+	assertNoPartial(t, dest)
+	assertNoLiveLinks(t, dest)
+}
+
+// TestPullFailsOnAStuckPartialLink: a leftover linked into the staging tree
+// becomes live at the swap, so if the partial tree cannot be removed and
+// neither can that leftover's name in it, the pull fails before the swap.
+func TestPullFailsOnAStuckPartialLink(t *testing.T) {
+	fake := s3test.NewFake()
+	files := map[string]string{"a.txt": "alpha", "b.txt": "bravo"}
+	pushFixture(t, fake, files)
+	dest := filepath.Join(t.TempDir(), "dest")
+	writeFile(t, partialDir(dest), "a.txt", "alpha", 0o644)
+	stuck := filepath.Join(partialDir(dest), "a.txt")
+	restoreRemove := pull.SetRemoveFn(func(p string) error {
+		if p == stuck {
+			return errors.New("held open")
+		}
+		return os.Remove(p)
+	})
+	restoreAll := pull.SetRemoveAllFn(func(p string) error {
+		if p == partialDir(dest) {
+			return errors.New("held open")
+		}
+		return os.RemoveAll(p)
+	})
+
+	_, err := doPull(t, fake, dest)
+	restoreAll()
+	restoreRemove()
+	if err == nil {
+		t.Fatal("Pull left a live file with a second name and succeeded")
+	}
+	if _, err := os.Lstat(dest); err == nil {
+		t.Error("failed pull created dest")
+	}
+	assertNoLeftovers(t, dest)
+
+	mustPull(t, fake, dest)
+	assertTree(t, dest, files)
 	assertNoPartial(t, dest)
 }

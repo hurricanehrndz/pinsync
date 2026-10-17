@@ -90,14 +90,20 @@ the new tree next to the destination, then renames it into place:
 
 If the pull fails before the swap, from an error, a timeout or being killed,
 `/etc/myapp` stays as it was and the staged files move to
-`/etc/myapp.pinsync-partial/`. The next pull hashes them again, uses any whose
-bytes match a manifest entry, and downloads only the rest. A file of 1 MiB or
-more cut off mid-download is kept as well, with the object's ETag, and the
-next pull asks S3 only for the missing bytes, with a ranged GET that fails if
-the object's ETag has changed. The whole file's SHA256 must still match the
-manifest. If the object changed, the server ignores the range, or the hash
-fails, that pull downloads the file again in full. A smaller file cut off is
-fetched again in full. A successful pull removes the partial tree.
+`/etc/myapp.pinsync-partial/`. Hardlinks to live files are left out, so no
+live file gets a second name; the next pull links them again. It hashes the
+kept files again, uses any whose bytes match a manifest entry, and downloads
+only the rest. A file of 1 MiB or more cut off mid-download is kept as well,
+with the object's ETag, and the next pull asks S3 only for the missing bytes,
+with a ranged GET that fails if the object's ETag has changed. The whole
+file's SHA256 must still match the manifest. If the object changed, the server
+ignores the range, or the hash fails, that pull downloads the file again in
+full. A smaller file cut off is fetched again in full. A successful pull
+tries to remove the partial tree. Whatever cannot be removed, such as a file
+held open on Windows, stays for a later pull, but never as a second name of a
+live file: a pull that can't drop one fails before the swap, and recovery
+fails if it can't drop one or remove the tree. Recovery also clears such names
+from a partial tree left by an older version.
 
 Pull owns `/etc/myapp`. A file you drop in there by hand isn't in the manifest,
 so the next pull removes it.
@@ -262,7 +268,7 @@ retried after the callback.
 - `pull.Recover(ctx, dest, logger)` finishes or rolls back an interrupted swap
   using only `dest` and its siblings. It never promotes the unverified staging
   tree; it keeps it as `dest.pinsync-partial` for the next pull to reuse,
-  including any download cut off partway.
+  including any download cut off partway, less any second names of live files.
 - `pull.Siblings(dest)` lists every directory pull creates beside `dest`
   (`.pinsync-tmp`, `.pinsync-old` and `.pinsync-partial`), for overlap checks
   or permission repair.

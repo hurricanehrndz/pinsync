@@ -167,8 +167,10 @@ func TestPullWithManifestRustFS(t *testing.T) {
 		}
 		assertTree(t, dest, v1)
 		assertNoLeftovers(t, dest)
-		// The verified v2 tree is kept for the next pull to reuse.
-		assertTree(t, partialDir(dest), v2)
+		// The verified v2 tree is kept for the next pull to reuse, less the
+		// live file it linked, which would otherwise have a second name.
+		assertTree(t, partialDir(dest), map[string]string{"sub/b.txt": "BRAVO2"})
+		assertNoLiveLinks(t, dest)
 	})
 
 	t.Run("interrupted swap recovered offline", func(t *testing.T) {
