@@ -10,7 +10,7 @@ import (
 
 // renameFn, removeFn and removeAllFn are test seams for interrupting the
 // swap between its renames and for failing the renames and removals of
-// sibling trees and kept prefixes.
+// sibling trees, kept prefixes and staged files the live tree shares.
 var (
 	renameFn    = os.Rename
 	removeFn    = os.Remove

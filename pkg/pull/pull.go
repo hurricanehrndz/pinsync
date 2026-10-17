@@ -4,9 +4,10 @@
 // the live tree, assembles a verified sibling tree (hardlink unchanged /
 // copy mode-changed / download changed), re-verifies that tree against the
 // manifest, and atomically swaps it in. On any failure before the swap the
-// destination is left byte-for-byte untouched, and the files staged so far
-// are kept beside it so the next run downloads only what is still missing,
-// resuming a large download cut off partway.
+// destination is left byte-for-byte untouched, and the files staged so far,
+// less the hardlinks to live files, are kept beside it so the next run
+// downloads only what is still missing, resuming a large download cut off
+// partway.
 //
 // PullWithManifest also returns the exact manifest bytes it installed, and
 // Options.BeforeReplace lets a caller persist them before the swap.
@@ -280,7 +281,7 @@ func (s *syncer) replace(ctx context.Context, raw []byte, m *manifest.Manifest) 
 // hashPartial indexes the partial tree by content, leaving out the prefixes
 // of cut-off downloads (see resumeDir), which match no entry. The partial tree only
 // saves downloads, so one that cannot be read is logged and treated as empty;
-// either way staging removes it once nothing more can come from it.
+// either way staging tries to remove it once nothing more can come from it.
 // CEILING: this reads every partial byte, including files that were linked
 // from the live tree and so were just hashed there. Bounded by one manifest's
 // content and far cheaper than downloading; if it matters, skip inodes that

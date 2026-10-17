@@ -2,7 +2,9 @@ package pull
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"io/fs"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -14,7 +16,8 @@ import (
 // or the fully swapped-in new one (a crash after both renames), and only the
 // partial tree may remain beside it: a leftover staging tree is kept there
 // for the next pull to reuse by content, with any download it cut off
-// partway for the next pull to resume (see resumeDir). It never promotes the
+// partway for the next pull to resume (see resumeDir). Nothing kept there is
+// a live file under a second name (see unsharePartial). It never promotes the
 // unverified staging tree. Pull, PullWithManifest, and ReplaceFromDirectory run it first
 // themselves.
 func Recover(ctx context.Context, dest string, logger *slog.Logger) error {
@@ -37,22 +40,55 @@ func Recover(ctx context.Context, dest string, logger *slog.Logger) error {
 // kept as the partial tree (see keepStaged): never promoted, only re-hashed
 // and reused by content, its cut-off downloads continued only when the
 // object still has the ETag they were fetched with and the result hashes
-// right.
+// right. Then the partial tree, whether or not it came from tmp, is cleared
+// of second names of live files (see unsharePartial). That runs after tmp is
+// gone: a leftover the failed pull linked into tmp has one name again and is
+// kept, where clearing first would drop it and then lose tmp's name with tmp.
+// A stale old tree that cannot be removed, or restored, does not stop either
+// step: the error is returned with theirs, first. A stuck old tree would
+// otherwise keep live files' second names in the partial tree, and with
+// dest missing there are no live files, so the cleanup is harmless.
 func recoverInterrupted(dest, tmp, old, partial string, logger *slog.Logger) error {
+	var oldErr error
 	switch {
 	case !exists(old): // nothing to roll back or clean up
 	case exists(dest):
 		logger.Warn("removing stale directory from an interrupted pull", "path", old)
-		if err := os.RemoveAll(old); err != nil {
-			return fmt.Errorf("pull: removing stale %s: %w", old, err)
+		if err := removeAllFn(old); err != nil {
+			oldErr = fmt.Errorf("pull: removing stale %s: %w", old, err)
 		}
 	default:
 		logger.Warn("restoring previous tree after an interrupted swap", "from", old, "to", dest)
 		if err := os.Rename(old, dest); err != nil {
-			return fmt.Errorf("pull: restoring %s from %s: %w", dest, old, err)
+			oldErr = fmt.Errorf("pull: restoring %s from %s: %w", dest, old, err)
 		}
 	}
-	return keepStaged(tmp, partial, logger)
+	err := keepStaged(tmp, partial, logger)
+	return errors.Join(oldErr, err, unsharePartial(partial, logger))
+}
+
+// unsharePartial drops every name in the partial tree whose file has another
+// name (see dropShared), so none is a live file: a caller may reject a live
+// file with a second link, as osconfig-sync does on Windows. v0.5.0 and
+// v0.5.1 kept the live files a failed pull linked, and a successful pull
+// whose partial tree was stuck kept the leftovers it linked into the new
+// tree. If one cannot be dropped, the partial tree is deleted. If it cannot
+// be deleted either, the error is returned: a pull would only report
+// success for a tree some callers reject, and stage would fail on it anyway.
+func unsharePartial(partial string, logger *slog.Logger) error {
+	if !exists(partial) {
+		return nil
+	}
+	err := dropShared(partial)
+	if err == nil {
+		return nil
+	}
+	logger.Warn("could not drop kept files the live tree may share; discarding them",
+		"path", partial, "error", err)
+	if err := removeAllFn(partial); err != nil {
+		return fmt.Errorf("pull: removing %s, which may share live files: %w", partial, err)
+	}
+	return nil
 }
 
 // keepStaged keeps a staging tree that never reached its swap as the partial
@@ -67,11 +103,20 @@ func recoverInterrupted(dest, tmp, old, partial string, logger *slog.Logger) err
 // prefixes move into the partial tree (see stashPrefixes): they include the
 // ones stage adopted from it, so while that tree is stuck a slow link would
 // otherwise lose every run's progress on a large object.
+//
+// First, every staged file with a second name is dropped (see dropShared),
+// so nothing kept is also a live file: a caller may reject a live file with
+// a second link, as osconfig-sync does on Windows. If one cannot be dropped,
+// tmp is deleted without keeping anything from it.
 func keepStaged(tmp, partial string, logger *slog.Logger) error {
 	if !exists(tmp) {
 		return nil
 	}
-	if !exists(partial) {
+	shared := dropShared(tmp)
+	if shared != nil {
+		logger.Warn("could not drop staged files the live tree may share; discarding them",
+			"path", tmp, "error", shared)
+	} else if !exists(partial) {
 		err := renameFn(tmp, partial)
 		if err == nil {
 			logger.Info("kept staged files for the next pull to reuse", "path", partial)
@@ -80,11 +125,38 @@ func keepStaged(tmp, partial string, logger *slog.Logger) error {
 		logger.Warn("could not keep staged files for the next pull; discarding them",
 			"from", tmp, "to", partial, "error", err)
 	}
-	stashPrefixes(tmp, partial, logger)
+	if shared == nil {
+		stashPrefixes(tmp, partial, logger)
+	}
 	if err := removeAllFn(tmp); err != nil {
 		return fmt.Errorf("pull: removing stale %s: %w", tmp, err)
 	}
 	return nil
+}
+
+// dropShared removes every name under root, a staging or partial tree,
+// whose file has another name, wherever that is. Staging links a live file at its own path (actLink),
+// but a leftover it links (actReuse) or a prefix it adopts can share one at
+// another path: a leftover is only copied when its content hashed the same
+// as a live file's, and prefixes are not checked at all. Counting links
+// catches every case and needs nothing from the failed attempt, which
+// recovery after a kill does not have. A linked live file costs nothing to
+// link again; downloads, copies and prefixes have one name and stay.
+// Removing a name leaves the file as it is: os.Remove clears the read-only
+// attribute only of a file it cannot otherwise delete, and a read-only file
+// is never linked (see readOnlyOnWindows). It returns the first file it
+// could neither show to have one name nor remove.
+func dropShared(root string) error {
+	return filepath.WalkDir(root, func(p string, d fs.DirEntry, err error) error {
+		if err != nil || d.IsDir() {
+			return err
+		}
+		sole, err := soleName(p)
+		if err == nil && sole {
+			return nil
+		}
+		return removeFn(p)
+	})
 }
 
 // stashPrefixes moves the files in tmp's resume directory into partial's,
