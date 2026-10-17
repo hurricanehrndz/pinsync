@@ -10,11 +10,11 @@ import (
 	"fmt"
 	"log/slog"
 	"regexp"
+	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/aws/arn"
 	awsconfig "github.com/aws/aws-sdk-go-v2/config"
-	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 
 	"github.com/hurricanehrndz/pinsync/pkg/rolesanywhere"
@@ -43,13 +43,18 @@ type RAConfig struct {
 	CertStore      rolesanywhere.StoreLoc
 }
 
+// raExpiryWindow is how long before expiry Roles Anywhere credentials are
+// refreshed, so a request is not signed with credentials about to lapse.
+const raExpiryWindow = 5 * time.Minute
+
 // Load resolves an aws.Config. Without RolesAnywhere it uses the standard SDK
-// default chain, applying Region only when set. With RolesAnywhere it selects
-// the device certificate, exchanges it for temporary credentials via a Roles
-// Anywhere CreateSession, and builds the config from them; the region is
-// resolved once so the CreateSession exchange and the resulting config agree,
-// and the certificate's private key never leaves its store. The endpoint is not
-// applied here: it is session-agnostic and belongs to the S3 client.
+// default chain, applying Region only when set. With RolesAnywhere its
+// credentials come from a cached rolesanywhere.Provider, which selects the
+// device certificate and exchanges it via a Roles Anywhere CreateSession, again
+// whenever the credentials near expiry; the region is resolved once so the
+// exchange and the resulting config agree, and the certificate's private key
+// never leaves its store. The endpoint is not applied here: it is
+// session-agnostic and belongs to the S3 client.
 func Load(ctx context.Context, cfg Config) (aws.Config, error) {
 	if cfg.RolesAnywhere == nil {
 		var loadOpts []func(*awsconfig.LoadOptions) error
@@ -64,27 +69,25 @@ func Load(ctx context.Context, cfg Config) (aws.Config, error) {
 	if err != nil {
 		return aws.Config{}, err
 	}
-	id, _, err := rolesanywhere.FindIdentity(cfg.Logger, ra.CertField, ra.CertPattern, ra.CertStore)
-	if err != nil {
-		return aws.Config{}, err
-	}
-	defer id.Close()
-	creds, err := rolesanywhere.Fetch(ctx, id, rolesanywhere.Options{
-		TrustAnchorARN: ra.TrustAnchorARN,
-		ProfileARN:     ra.ProfileARN,
-		RoleARN:        ra.RoleARN,
-		Region:         region,
-		Logger:         cfg.Logger,
-	})
-	if err != nil {
+	creds := aws.NewCredentialsCache(
+		rolesanywhere.NewProvider(ra.CertField, ra.CertPattern, ra.CertStore, rolesanywhere.Options{
+			TrustAnchorARN: ra.TrustAnchorARN,
+			ProfileARN:     ra.ProfileARN,
+			RoleARN:        ra.RoleARN,
+			Region:         region,
+			Logger:         cfg.Logger,
+		}),
+		func(o *aws.CredentialsCacheOptions) { o.ExpiryWindow = raExpiryWindow },
+	)
+	// Retrieve once now so a missing certificate or a rejected CreateSession
+	// fails here, before any transfer starts, rather than on the first request.
+	if _, err := creds.Retrieve(ctx); err != nil {
 		return aws.Config{}, err
 	}
 	return awsconfig.LoadDefaultConfig(
 		ctx,
 		awsconfig.WithRegion(region),
-		awsconfig.WithCredentialsProvider(credentials.NewStaticCredentialsProvider(
-			creds.AccessKeyID, creds.SecretAccessKey, creds.SessionToken,
-		)),
+		awsconfig.WithCredentialsProvider(creds),
 	)
 }
 
